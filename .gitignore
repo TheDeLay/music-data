@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Secrets
+.env
+.spotify_token.json
+*.pem
+*.key
+
+# Data — never commit listening history or DB
+data/raw/
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Generated summaries — these CAN be committed if you want, but default to ignoring
+# since they may contain PII (your listening habits)
+summaries/*.md
+!summaries/.gitkeep
