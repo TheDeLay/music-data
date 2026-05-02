@@ -4,7 +4,7 @@
 
 ## When to use this file
 
-You're following the manual path from [the article](https://thedelay.com/spotify-music-archive). You'd rather read every command before running it than have an AI drive things. Or you've spent any time in InfoSec and, correctly, don't let an AI agent run shell on your machine. Either way, this is your file.
+You're following the manual path from [the article](https://thedelay.com/spotify-music-archive/). You'd rather read every command before running it than have an AI drive things. Or you've spent any time in InfoSec and, correctly, don't let an AI agent run shell on your machine. Either way, this is your file.
 
 If you'd rather hand setup to your AI, see [`setup-with-ai.md`](./setup-with-ai.md). Both paths land in the same place.
 
@@ -160,8 +160,8 @@ Both should print "ALL CHECKS PASSED" / "All assertions passed."
 ## Where to go next
 
 - **The "what does this answer?" examples in the [README](./README.md#what-this-answers).**
-- **The companion article on schema choices:** [music-data: The Schema Story](https://thedelay.com/spotify-music-archive-nerd-stuff) (publishing soon).
-- **The original article:** [Spotify Has 12 Years of My Data. I Just Took It Back.](https://thedelay.com/spotify-music-archive)
+- **The companion article on schema choices:** **music-data: The Schema Story** (publishing shortly on TheDeLay.com).
+- **The original article:** [Spotify Has 12 Years of My Data. I Just Took It Back.](https://thedelay.com/spotify-music-archive/)
 
 ---
 

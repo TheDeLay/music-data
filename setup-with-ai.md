@@ -6,7 +6,7 @@
 
 A self-contained instruction set you can hand to any AI assistant with shell access — Claude Code, Cursor, ChatGPT Desktop with code interpreter, Cowork, etc. The AI reads this file, asks you the questions only you can answer, and drives the rest of setup itself.
 
-The thesis behind this approach is the same one in the [companion article](https://thedelay.com/spotify-music-archive): give your AI structured context, and the conversation becomes work — not chat. This file is the structured context for setup.
+The thesis behind this approach is the same one in the [companion article](https://thedelay.com/spotify-music-archive/): give your AI structured context, and the conversation becomes work — not chat. This file is the structured context for setup.
 
 ## The prompt to paste
 
