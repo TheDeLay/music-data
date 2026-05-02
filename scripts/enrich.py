@@ -35,9 +35,11 @@ from .db import connect, init_schema, start_run, finish_run
 from .spotify_client import SpotifyClient
 
 console = Console()
-TRACK_BATCH = 50
-ALBUM_BATCH = 20
-ARTIST_BATCH = 50
+# Single-ID per call (batch endpoints 403 for new Dev apps post Feb 2026).
+# These constants control how many we process per DB transaction, not API batch.
+TRACK_BATCH = 25
+ALBUM_BATCH = 25
+ARTIST_BATCH = 25
 
 
 def _parse_release_year(release_date: str | None) -> int | None:
@@ -63,30 +65,125 @@ def _parse_age(spec: str | None) -> timedelta | None:
     raise ValueError(f"can't parse age spec: {spec!r}")
 
 
-def _select_targets(conn, table: str, uri_col: str, refresh_older_than: timedelta | None):
-    """Return rows that need enrichment.
-
-    A row needs enrichment if last_enriched_at IS NULL, OR if --refresh-older-than
-    was given and last_enriched_at is older than that threshold.
-    """
+def _age_clause(refresh_older_than: timedelta | None, col: str = "last_enriched_at") -> tuple[str, list]:
+    """Build an SQL fragment for the staleness filter. Returns (sql, params)."""
     if refresh_older_than is None:
-        return conn.execute(
-            f"SELECT {table.rstrip('s')}_id AS id, {uri_col} AS uri "
-            f"FROM {table} WHERE last_enriched_at IS NULL"
-        ).fetchall()
+        return f"{col} IS NULL", []
     cutoff = (datetime.utcnow() - refresh_older_than).strftime("%Y-%m-%d %H:%M:%S")
+    return f"({col} IS NULL OR {col} < ?)", [cutoff]
+
+
+def _select_track_targets(conn, refresh_older_than, min_plays: int):
+    """Tracks needing enrichment, filtered to those with at least min_plays."""
+    age_sql, params = _age_clause(refresh_older_than, "t.last_enriched_at")
+    if min_plays <= 1:
+        return conn.execute(
+            f"SELECT t.track_id AS id, t.spotify_track_uri AS uri "
+            f"FROM tracks t WHERE {age_sql}",
+            params,
+        ).fetchall()
     return conn.execute(
-        f"SELECT {table.rstrip('s')}_id AS id, {uri_col} AS uri "
-        f"FROM {table} WHERE last_enriched_at IS NULL OR last_enriched_at < ?",
-        (cutoff,),
+        f"""
+        SELECT t.track_id AS id, t.spotify_track_uri AS uri
+        FROM tracks t
+        JOIN (
+            SELECT track_id, COUNT(*) AS c
+            FROM plays WHERE content_type = 'track'
+            GROUP BY track_id
+            HAVING c >= ?
+        ) tp ON t.track_id = tp.track_id
+        WHERE {age_sql}
+        """,
+        [min_plays] + params,
+    ).fetchall()
+
+
+def _select_album_targets(conn, refresh_older_than, min_plays: int):
+    """Albums with a URI and unenriched, where any track on the album has >= min_plays plays.
+
+    Note: only albums whose URI has been populated (by track enrichment) are
+    candidates. Albums without a URI can't be looked up and stay unenriched.
+    """
+    age_sql, params = _age_clause(refresh_older_than, "al.last_enriched_at")
+    base = f"al.spotify_album_uri IS NOT NULL AND {age_sql}"
+    if min_plays <= 1:
+        return conn.execute(
+            f"SELECT al.album_id AS id, al.spotify_album_uri AS uri FROM albums al WHERE {base}",
+            params,
+        ).fetchall()
+    return conn.execute(
+        f"""
+        SELECT al.album_id AS id, al.spotify_album_uri AS uri
+        FROM albums al
+        WHERE {base}
+          AND EXISTS (
+            SELECT 1 FROM tracks t
+            JOIN plays p ON p.track_id = t.track_id AND p.content_type = 'track'
+            WHERE t.album_id = al.album_id
+            GROUP BY t.album_id
+            HAVING COUNT(*) >= ?
+          )
+        """,
+        params + [min_plays],
+    ).fetchall()
+
+
+def _select_artist_uri_targets(conn, refresh_older_than, min_plays: int):
+    """Artists with a URI and unenriched, where the artist's total play count >= min_plays."""
+    age_sql, params = _age_clause(refresh_older_than, "ar.last_enriched_at")
+    base = f"ar.spotify_artist_uri IS NOT NULL AND {age_sql}"
+    if min_plays <= 1:
+        return conn.execute(
+            f"SELECT ar.artist_id AS id, ar.spotify_artist_uri AS uri FROM artists ar WHERE {base}",
+            params,
+        ).fetchall()
+    return conn.execute(
+        f"""
+        SELECT ar.artist_id AS id, ar.spotify_artist_uri AS uri
+        FROM artists ar
+        WHERE {base}
+          AND (
+            SELECT COUNT(*) FROM plays p
+            JOIN tracks t ON p.track_id = t.track_id
+            JOIN track_artists ta ON t.track_id = ta.track_id AND ta.position = 0
+            WHERE ta.artist_id = ar.artist_id AND p.content_type = 'track'
+          ) >= ?
+        """,
+        params + [min_plays],
+    ).fetchall()
+
+
+def _select_artist_name_targets(conn, min_plays: int):
+    """Name-only artists (no URI yet) whose total play count >= min_plays.
+
+    These are the ones worth resolving via /search. The long tail (single plays
+    by random artists) is intentionally skipped to stay polite to the API.
+    """
+    if min_plays <= 1:
+        return conn.execute(
+            "SELECT artist_id, name FROM artists WHERE spotify_artist_uri IS NULL"
+        ).fetchall()
+    return conn.execute(
+        """
+        SELECT ar.artist_id, ar.name
+        FROM artists ar
+        WHERE ar.spotify_artist_uri IS NULL
+          AND (
+            SELECT COUNT(*) FROM plays p
+            JOIN tracks t ON p.track_id = t.track_id
+            JOIN track_artists ta ON t.track_id = ta.track_id AND ta.position = 0
+            WHERE ta.artist_id = ar.artist_id AND p.content_type = 'track'
+          ) >= ?
+        """,
+        (min_plays,),
     ).fetchall()
 
 
 # -----------------------------------------------------------------------------
 # Track enrichment
 # -----------------------------------------------------------------------------
-def enrich_tracks(conn, client: SpotifyClient, run_id: int, refresh_older_than) -> int:
-    rows = _select_targets(conn, "tracks", "spotify_track_uri", refresh_older_than)
+def enrich_tracks(conn, client: SpotifyClient, run_id: int, refresh_older_than, min_plays: int = 1) -> int:
+    rows = _select_track_targets(conn, refresh_older_than, min_plays)
     if not rows:
         console.print("[dim]No tracks need enrichment.[/dim]")
         return 0
@@ -110,12 +207,12 @@ def enrich_tracks(conn, client: SpotifyClient, run_id: int, refresh_older_than) 
             try:
                 for uri, api_track in zip(uris, api_tracks):
                     if api_track is None:
-                        # Spotify returns null for tracks that no longer exist
-                        conn.execute(
-                            "UPDATE tracks SET last_enriched_at = datetime('now') "
-                            "WHERE spotify_track_uri = ?",
-                            (uri,),
-                        )
+                        # None = either 404 (deleted) or retries exhausted (rate limit /
+                        # transient 5xx). In either case, leave last_enriched_at NULL
+                        # so a future run picks it up. The cost of re-trying a truly
+                        # deleted track is one wasted call per run — fine. The cost of
+                        # marking an exhausted-retry track as 'enriched' would be
+                        # losing it forever from the resume queue.
                         continue
 
                     # Resolve / create album
@@ -254,26 +351,13 @@ def _upsert_artist_from_api(conn, api_artist: dict) -> int:
 # -----------------------------------------------------------------------------
 # Artist enrichment (genres + popularity + followers)
 # -----------------------------------------------------------------------------
-def enrich_artists(conn, client: SpotifyClient, run_id: int, refresh_older_than) -> int:
+def enrich_artists(conn, client: SpotifyClient, run_id: int, refresh_older_than, min_plays: int = 1) -> int:
     """Fill in genres/popularity/followers for artists with a URI but missing detail."""
-    if refresh_older_than is None:
-        rows = conn.execute(
-            "SELECT artist_id AS id, spotify_artist_uri AS uri FROM artists "
-            "WHERE spotify_artist_uri IS NOT NULL AND last_enriched_at IS NULL"
-        ).fetchall()
-    else:
-        cutoff = (datetime.utcnow() - refresh_older_than).strftime("%Y-%m-%d %H:%M:%S")
-        rows = conn.execute(
-            "SELECT artist_id AS id, spotify_artist_uri AS uri FROM artists "
-            "WHERE spotify_artist_uri IS NOT NULL "
-            "AND (last_enriched_at IS NULL OR last_enriched_at < ?)",
-            (cutoff,),
-        ).fetchall()
+    rows = list(_select_artist_uri_targets(conn, refresh_older_than, min_plays))
 
-    # Also: artists that have NO URI yet (created from dump name only) — try to find them
-    name_only = conn.execute(
-        "SELECT artist_id, name FROM artists WHERE spotify_artist_uri IS NULL"
-    ).fetchall()
+    # Also: artists with NO URI yet whose play-count meets the threshold —
+    # resolve via /search. (Long-tail single-play artists are intentionally skipped.)
+    name_only = _select_artist_name_targets(conn, min_plays)
 
     # Resolve name-only artists by search
     if name_only:
@@ -288,17 +372,60 @@ def enrich_artists(conn, client: SpotifyClient, run_id: int, refresh_older_than)
                     progress.advance(task)
                     continue
                 if found and found.get("uri"):
+                    new_uri = found["uri"]
                     conn.execute("BEGIN")
                     try:
-                        conn.execute(
-                            "UPDATE artists SET spotify_artist_uri = ? WHERE artist_id = ?",
-                            (found["uri"], r["artist_id"]),
-                        )
+                        # Did track enrichment already create a URI-bearing row for this
+                        # same artist? If yes, merge the orphan into the existing row.
+                        existing = conn.execute(
+                            "SELECT artist_id FROM artists WHERE spotify_artist_uri = ?",
+                            (new_uri,),
+                        ).fetchone()
+                        if existing and existing["artist_id"] != r["artist_id"]:
+                            target_id = existing["artist_id"]
+                            orphan_id = r["artist_id"]
+                            # Repoint track_artists. Use UPDATE OR IGNORE because the
+                            # same track may already link to the URI-bearing row, in
+                            # which case we'd hit the (track_id, artist_id) PK; OR
+                            # IGNORE skips those, then we DELETE any stragglers.
+                            conn.execute(
+                                "UPDATE OR IGNORE track_artists SET artist_id = ? WHERE artist_id = ?",
+                                (target_id, orphan_id),
+                            )
+                            conn.execute(
+                                "DELETE FROM track_artists WHERE artist_id = ?",
+                                (orphan_id,),
+                            )
+                            # Repoint labels (in case the user labeled the orphan).
+                            conn.execute(
+                                "UPDATE OR IGNORE artist_labels SET artist_id = ? WHERE artist_id = ?",
+                                (target_id, orphan_id),
+                            )
+                            conn.execute(
+                                "DELETE FROM artist_labels WHERE artist_id = ?",
+                                (orphan_id,),
+                            )
+                            conn.execute(
+                                "DELETE FROM artist_labels_history WHERE artist_id = ?",
+                                (orphan_id,),
+                            )
+                            # Delete the orphan row itself.
+                            conn.execute(
+                                "DELETE FROM artists WHERE artist_id = ?",
+                                (orphan_id,),
+                            )
+                            merged_id = target_id
+                        else:
+                            conn.execute(
+                                "UPDATE artists SET spotify_artist_uri = ? WHERE artist_id = ?",
+                                (new_uri, r["artist_id"]),
+                            )
+                            merged_id = r["artist_id"]
                         conn.execute("COMMIT")
                     except Exception:
                         conn.execute("ROLLBACK")
                         raise
-                    rows.append({"id": r["artist_id"], "uri": found["uri"]})
+                    rows.append({"id": merged_id, "uri": new_uri})
                 progress.advance(task)
 
     if not rows:
@@ -324,10 +451,8 @@ def enrich_artists(conn, client: SpotifyClient, run_id: int, refresh_older_than)
             try:
                 for uri, api in zip(uris, api_artists):
                     if api is None:
-                        conn.execute(
-                            "UPDATE artists SET last_enriched_at = datetime('now') "
-                            "WHERE spotify_artist_uri = ?", (uri,),
-                        )
+                        # 404 or retries exhausted — leave for future run (see
+                        # comment in enrich_tracks for full rationale).
                         continue
                     conn.execute(
                         """
@@ -359,21 +484,8 @@ def enrich_artists(conn, client: SpotifyClient, run_id: int, refresh_older_than)
 # -----------------------------------------------------------------------------
 # Album enrichment (for albums that came in via track enrichment but lack details)
 # -----------------------------------------------------------------------------
-def enrich_albums(conn, client: SpotifyClient, run_id: int, refresh_older_than) -> int:
-    if refresh_older_than is None:
-        rows = conn.execute(
-            "SELECT album_id AS id, spotify_album_uri AS uri FROM albums "
-            "WHERE spotify_album_uri IS NOT NULL AND last_enriched_at IS NULL"
-        ).fetchall()
-    else:
-        cutoff = (datetime.utcnow() - refresh_older_than).strftime("%Y-%m-%d %H:%M:%S")
-        rows = conn.execute(
-            "SELECT album_id AS id, spotify_album_uri AS uri FROM albums "
-            "WHERE spotify_album_uri IS NOT NULL "
-            "AND (last_enriched_at IS NULL OR last_enriched_at < ?)",
-            (cutoff,),
-        ).fetchall()
-
+def enrich_albums(conn, client: SpotifyClient, run_id: int, refresh_older_than, min_plays: int = 1) -> int:
+    rows = _select_album_targets(conn, refresh_older_than, min_plays)
     if not rows:
         console.print("[dim]No albums need enrichment.[/dim]")
         return 0
@@ -397,10 +509,7 @@ def enrich_albums(conn, client: SpotifyClient, run_id: int, refresh_older_than) 
             try:
                 for uri, api in zip(uris, api_albums):
                     if api is None:
-                        conn.execute(
-                            "UPDATE albums SET last_enriched_at = datetime('now') "
-                            "WHERE spotify_album_uri = ?", (uri,),
-                        )
+                        # 404 or retries exhausted — leave for future run.
                         continue
                     release_date = api.get("release_date")
                     conn.execute(
@@ -441,6 +550,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--all", action="store_true", help="Run all enrichment passes in correct order")
     parser.add_argument("--refresh-older-than", default=None,
                         help="Re-enrich rows older than this (e.g. 90d, 4w, 24h)")
+    parser.add_argument("--min-plays", type=int, default=1,
+                        help="Only enrich tracks (and their albums/artists) with at least this "
+                             "many plays. Default 1 (all). Useful values: 20 (top engagement, "
+                             "~45 min), 5 (covers ~65%% of plays, ~2-3 hours).")
+    parser.add_argument("--rate-interval", type=float, default=1.0,
+                        help="Minimum seconds between API calls. Default 1.0 (60 req/min).")
     args = parser.parse_args(argv)
 
     if not (args.tracks or args.albums or args.artists or args.all):
@@ -450,17 +565,20 @@ def main(argv: list[str] | None = None) -> int:
 
     conn = connect()
     init_schema(conn)
-    run_id = start_run(conn, source="enrichment")
-    client = SpotifyClient()
+    run_id = start_run(conn, source="enrichment",
+                       notes=f"min_plays={args.min_plays} rate={args.rate_interval}s")
+    # Enrichment hits public catalog endpoints only — Client Credentials grant
+    # is correct here (no user context required, no browser/OAuth dance).
+    client = SpotifyClient(auth="app", min_request_interval=args.rate_interval)
 
     total_updated = 0
     try:
         if args.all or args.tracks:
-            total_updated += enrich_tracks(conn, client, run_id, refresh)
+            total_updated += enrich_tracks(conn, client, run_id, refresh, args.min_plays)
         if args.all or args.albums:
-            total_updated += enrich_albums(conn, client, run_id, refresh)
+            total_updated += enrich_albums(conn, client, run_id, refresh, args.min_plays)
         if args.all or args.artists:
-            total_updated += enrich_artists(conn, client, run_id, refresh)
+            total_updated += enrich_artists(conn, client, run_id, refresh, args.min_plays)
     except Exception as e:
         finish_run(conn, run_id, status="failed", notes=str(e))
         console.print(f"[red]Enrichment failed:[/red] {e}")

@@ -409,11 +409,14 @@ INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('created_at', datetime('
 -- Spotify's metadata can't capture.
 --
 -- Examples:
---   ('christian', 'y')       -- explicitly Christian/faith-based
---   ('christian', 'm')       -- "kinda" / inoffensive / borderline
---   ('christian', 'n')       -- explicitly not
 --   ('workout', 'y')         -- works for workouts
+--   ('workout', 'm')         -- "kinda" — usable but not ideal
+--   ('workout', 'n')         -- not for workouts
 --   ('family_safe', 'n')     -- skip when family is around
+--   ('mood', 'melancholy')   -- multi-valued labels also work
+--
+-- Label keys are arbitrary; the schema doesn't constrain what dimensions
+-- you track. Keep keys lowercase + snake_case for consistency.
 --
 -- NULL semantics:
 --   Absence of a row for a (track, label_key) pair means UNKNOWN, not 'n'.
@@ -437,7 +440,7 @@ CREATE TABLE IF NOT EXISTS track_labels (
     label_key   TEXT NOT NULL,
     label_value TEXT NOT NULL,
     set_at      TEXT NOT NULL DEFAULT (datetime('now')),
-    set_by      TEXT,                       -- 'manual', 'rule:ccm_genre', 'bulk:2026_05_03', etc.
+    set_by      TEXT,                       -- 'manual', 'rule:genre_match', 'bulk:2026_05_03', etc.
     note        TEXT,
     PRIMARY KEY (track_id, label_key)
 );
