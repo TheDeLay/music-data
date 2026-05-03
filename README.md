@@ -61,9 +61,13 @@ track                       artist               backs   total_plays
 
 Track Q has four total plays and two of them ended with you rewinding. That's a track you keep skipping past *and* keep being grabbed by. Surface it.
 
-### "What was I actually listening to in the 90s?" / "Vocal-light tracks for working hours, sorted by tempo." / etc.
+### "What was I actually listening to in the 90s?" / "tracks I want to label as 'workout', sorted by length" / etc.
 
-The schema supports decade filtering (`albums.release_year`), genre tags (`artists.genres_json`), and any custom dimensions you want to label tracks/albums/artists with (`track_labels`, etc.). The point isn't a fixed query catalog — it's that you have the data shape to ask whatever question you want.
+The schema supports decade filtering (`albums.release_year` populates fine for new Dev Mode apps), and any custom dimensions you want to label tracks/albums/artists with (`track_labels`, etc.).
+
+Genre filtering via `artists.genres_json` is in the schema but **will be empty for new Dev Mode apps post-Feb-2026** (see Limitations below). Multi-source enrichment via MusicBrainz/AcousticBrainz is planned to fill that gap.
+
+The point isn't a fixed query catalog — it's that you have the data shape to ask whatever question you want.
 
 ---
 
@@ -76,6 +80,74 @@ Download [`setup-with-ai.md`](./setup-with-ai.md) and paste it into Claude Code,
 ### Path 2 — Read the script before running it
 
 Clone the repo and follow [`INSTALL.md`](./INSTALL.md). Same destination, manual journey. Plain terminal commands. No AI involvement. If you've spent any time in InfoSec you already know which path you'll pick, and that's fine. Both are first-class citizens here.
+
+---
+
+## Before you commit: known limitations
+
+Spotify tightened its Web API significantly between November 2024 and February 2026. This pipeline works within the new constraints, but you should know what you're agreeing to before you start.
+
+### Spotify Premium is required (for you, the developer)
+
+As of February 2026, all Spotify Web API Development Mode apps require the **app owner** to have an active Spotify Premium subscription. If your Premium lapses, the dev app stops working. **No Premium → this pipeline will not run.**
+
+This is a Spotify policy change, not a project decision. Source: [Spotify's February 2026 policy update](https://developer.spotify.com/blog/2026-02-06-update-on-developer-access-and-platform-security).
+
+### These metadata fields will be empty
+
+For new Dev Mode apps registered after February 6, 2026, Spotify's API returns NULL or empty for:
+
+- `track.popularity` — no global popularity score
+- `track.available_markets` — no regional availability
+- `artist.popularity` — no artist popularity score
+- `artist.followers.total` — no follower count
+- `artist.genres` — empty array; **no genre data at all**
+
+The schema still includes these columns (so existing pre-policy apps work, and so the data slot is ready if Spotify ever restores access), but if you're an individual developer running this in 2026 — **expect them to be empty**.
+
+The good news: the article's data-driven analyses don't rely on any of these. Engagement %, finish rate, back-button gold, decade distribution — all work because they use `duration_ms`, `album.release_date`, and the existing play-event signals, none of which are restricted.
+
+If you want genre, tempo, energy, or valence data, the planned multi-source enrichment will pull it from MusicBrainz and AcousticBrainz instead — open data sources that don't depend on Spotify's policy direction.
+
+### Daily API quota: ~700-900 calls
+
+Empirically observed during this project's development:
+
+| Pacing | Calls before wall | Resulting cooldown |
+|---|---|---|
+| Fast (~1,200/hr) | ~875 | **20.7 hours** |
+| Slow (~100/hr) | ~732 | **7.9 hours** |
+
+The wall hits in roughly the same place regardless of pacing — that's a daily/cumulative bucket, not a rolling window. But **slower pacing reduces the penalty severity** by ~3×.
+
+Plan for **~600 calls per night** as the sustainable target with the default settings. Full enrichment of a multi-year listening archive will span multiple nights.
+
+The pipeline's defaults are calibrated to these observations:
+
+- **35-second throttle** between calls (`--rate-interval 35.0`)
+- **60-second hard-stop** on a single 429 with a long Retry-After (`--long-penalty-threshold 60`) — bails immediately rather than retrying into a known-blocked state
+- **10-minute no-progress watchdog** (`--max-no-progress 600`) — aborts if no successful response in that window, instead of silently sleeping for hours
+- **Per-run log file** in `logs/enrich-{timestamp}.log` capturing every 429, watchdog warning, and end-of-run stats summary
+
+Run `python -m scripts.enrich --help` for full flag documentation. Defaults are tuned for unattended overnight runs — designed assuming you might kick the script off and go to bed.
+
+### Extended Quota Mode is not available to individual developers
+
+Since May 15, 2025, Extended Quota Mode requires:
+
+1. A legally registered business or organization (not an individual)
+2. Minimum 250,000 monthly active users
+3. Active, launched service in key Spotify markets
+4. Application via company email; up to 6-week review
+
+There is no upgrade path for individual developers. Dev Mode is the ceiling. If your use case requires volume the daily quota can't support, you need either a registered business entity at scale or a different data source.
+
+### What this means in practice
+
+- **Keep Premium active.** As long as you want to run this pipeline.
+- **Plan to span enrichment across multiple nights.** A 12-year listening archive isn't a one-evening job.
+- **Don't expect genre-aware features to work out of the box.** They'll come back via MusicBrainz/AcousticBrainz integration in a future version.
+- **The engagement queries work today.** Everything the companion article demonstrates is fully data-backed by what Dev Mode still returns.
 
 ---
 
@@ -103,11 +175,14 @@ python -m scripts.ingest_dump /path/to/Spotify\ Extended\ Streaming\ History/
 # Pull recent plays from the API (works without the dump too — useful for testing)
 python -m scripts.ingest_recent
 
-# Enrich most-played tracks first; long tail can wait
-python -m scripts.enrich --all --min-plays 20 --rate-interval 2.0
+# Enrich most-played tracks first; long tail can wait.
+# 35s/call is the SAFE default — well below Spotify's daily quota threshold.
+python -m scripts.enrich --all --min-plays 20 --rate-interval 35.0
 ```
 
-The `--min-plays N` flag enriches only tracks with at least N plays. Listening concentrates on a small fraction of unique tracks (Pareto distribution), so this is the difference between 40 minutes and 16 hours of throttled API calls. Useful values: `20` for the engagement-signal tier, `5` for ~65% of all plays covered, `1` for the long tail.
+The `--min-plays N` flag enriches only tracks with at least N plays. Listening concentrates on a small fraction of unique tracks (Pareto distribution), so this is the difference between one overnight run and many. Useful values: `20` for the engagement-signal tier, `5` for ~65% of all plays covered, `1` for the long tail (will take many nights — see Limitations above).
+
+The defaults are deliberately conservative. If you're impatient, you can lower `--rate-interval` — but read the Limitations section above first. Spotify's daily quota for Dev Mode apps is real and a fast burst hits it hard.
 
 ---
 
@@ -144,15 +219,15 @@ Roughly 20 tables, a handful of triggers for label history, and a few indexes tu
 
 ---
 
-## A note on rate limits and Spotify's API
+## API architecture (the technical why)
 
-This pipeline is built for **personal use under Spotify's Development Mode**. As of February 2026, that's the only mode hobbyist developers can use:
+A few things to know about how the pipeline talks to Spotify, beyond the limits in the section above:
 
-- **Single-ID GETs only.** Spotify's batch endpoints (`/tracks?ids=...`, `/artists?ids=...`, `/albums?ids=...`) return 403 for new Development-Mode apps. Single-ID endpoints (`/tracks/{id}`) still work, so the client uses those exclusively. This is the project's permanent architecture, not a workaround.
-- **Throttle and global 429 backoff.** Default 1s between calls (configurable via `--rate-interval`); 2-3s recommended for tier-1 enrichment runs. When Spotify returns 429, *all* subsequent calls wait per the `Retry-After` header — not just the one URL that 429'd.
-- **Be a good API citizen.** Read [Spotify's Developer Terms](https://developer.spotify.com/terms) before running a full enrichment pass. §VI.4 prohibits "excessive service calls"; §IV.2.2 prohibits crawler/spider behavior. This pipeline stays defensible by enriching only what *you* have personally listened to (no catalog crawling), filtering by a play-count threshold, throttling well below any plausible rate limit, and identifying itself with a User-Agent.
-- **Extended Quota Mode is not available** to individual hobbyist developers as of May 15, 2025 (legally-registered businesses with 250k+ MAUs only).
-- **Cooldowns can be long.** In testing, ~875 calls in 15 minutes triggered a `Retry-After` of about 20 hours. Plan accordingly. If you 429, walk away for a day.
+- **Single-ID GETs only.** Spotify's batch endpoints return 403 for Dev Mode apps post-Feb-2026. Single-ID endpoints (`/tracks/{id}`) still work, so the client uses those exclusively. This is the project's permanent architecture, not a workaround.
+- **Client Credentials grant** for catalog reads — no user OAuth, no browser dance, runs unattended.
+- **Global 429 backoff.** When Spotify returns 429 on any call, *all* subsequent calls wait per the `Retry-After` header — not just the one URL that 429'd. Without this, after a 429 we'd retry the one URL but immediately hammer the next URL using the same bucket.
+- **Long-Retry-After hard stop.** If a single 429 returns Retry-After above 60 seconds, the run aborts immediately rather than sleeping through it. This matters: making more calls during a penalty bucket can extend or worsen the penalty.
+- **Be a good API citizen.** Read [Spotify's Developer Terms](https://developer.spotify.com/terms) before running a full enrichment pass. §VI.4 prohibits "excessive service calls"; §IV.2.2 prohibits crawler/spider behavior. This pipeline stays defensible by enriching only what *you* have personally listened to (no catalog crawling), filtering by play-count threshold, throttling well below any plausible rate limit, and identifying itself with a clear User-Agent.
 
 ---
 

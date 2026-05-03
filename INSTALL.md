@@ -12,7 +12,7 @@ If you'd rather hand setup to your AI, see [`setup-with-ai.md`](./setup-with-ai.
 
 - **Python 3.10 or newer** — `python3 --version`
 - **`git`**
-- **A Spotify account.** Premium isn't required for ingest or enrichment, but it'll be required for playlist creation in future versions of the project.
+- **An active Spotify Premium subscription.** As of February 2026, Spotify requires the Web API Development Mode app owner to have an active Premium subscription. If yours lapses, the API stops responding to your dev app. This is a Spotify policy, not a project decision — see the README's "Known limitations" section for context.
 - **About 1 GB of disk space.** Your data dump is bigger than you'd think — JSON is verbose.
 
 ## Step 1 — Register a Spotify Developer App

@@ -25,16 +25,60 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from rich.console import Console
 from rich.progress import Progress, BarColumn, MofNCompleteColumn, TextColumn, TimeElapsedColumn
 
 from .db import connect, init_schema, start_run, finish_run
-from .spotify_client import SpotifyClient
+from .spotify_client import (
+    SpotifyClient,
+    RateLimitError,
+    SustainedRateLimitError,
+    LongPenaltyError,
+)
 
 console = Console()
+log = logging.getLogger("enrich")
+
+
+def _configure_logging(log_file: Path | None, level: str) -> Path:
+    """Set up dual logging: a structured per-run file (everything at INFO+) and
+    stdout (WARNING+ for live visibility, doesn't drown progress bars).
+
+    Returns the resolved log file path.
+    """
+    if log_file is None:
+        ts = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+        log_dir = Path(__file__).resolve().parent.parent / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"enrich-{ts}.log"
+    else:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fmt = logging.Formatter(
+        "[%(asctime)s] %(levelname)-5s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    file_h = logging.FileHandler(log_file)
+    file_h.setFormatter(fmt)
+    file_h.setLevel(getattr(logging, level.upper()))
+
+    stream_h = logging.StreamHandler(sys.stderr)
+    stream_h.setFormatter(fmt)
+    stream_h.setLevel(logging.WARNING)  # don't spam stdout with INFO
+
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    # Clear any handlers from prior init (matters in tests + repeated runs)
+    root.handlers.clear()
+    root.addHandler(file_h)
+    root.addHandler(stream_h)
+
+    return log_file
 # Single-ID per call (batch endpoints 403 for new Dev apps post Feb 2026).
 # These constants control how many we process per DB transaction, not API batch.
 TRACK_BATCH = 25
@@ -198,7 +242,10 @@ def enrich_tracks(conn, client: SpotifyClient, run_id: int, refresh_older_than, 
             uris = [r["uri"] for r in chunk]
             try:
                 api_tracks = client.get_tracks(uris)
+            except RateLimitError:
+                raise  # propagate to main() — abort run cleanly
             except Exception as e:
+                log.warning("Track batch failed (transient): %s", e)
                 console.print(f"[yellow]Track batch failed: {e}[/yellow]")
                 progress.advance(task, len(chunk))
                 continue
@@ -351,13 +398,23 @@ def _upsert_artist_from_api(conn, api_artist: dict) -> int:
 # -----------------------------------------------------------------------------
 # Artist enrichment (genres + popularity + followers)
 # -----------------------------------------------------------------------------
-def enrich_artists(conn, client: SpotifyClient, run_id: int, refresh_older_than, min_plays: int = 1) -> int:
-    """Fill in genres/popularity/followers for artists with a URI but missing detail."""
-    rows = list(_select_artist_uri_targets(conn, refresh_older_than, min_plays))
+def enrich_artists(conn, client: SpotifyClient, run_id: int, refresh_older_than,
+                   min_plays: int = 1, with_detail: bool = False) -> int:
+    """Resolve name-only artists via /search and (optionally) pull artist detail.
 
-    # Also: artists with NO URI yet whose play-count meets the threshold —
-    # resolve via /search. (Long-tail single-play artists are intentionally skipped.)
+    Two phases:
+      1. Search phase: artists with NO URI → /search?type=artist to resolve to URI.
+         Always runs. Useful: lets playlist generation later target Spotify URIs.
+      2. URI-detail phase: artists WITH URI → /artists/{id} for popularity/followers/genres.
+         Skipped by default since Feb 2026 — Dev Mode apps get all-NULL on these
+         fields. Set with_detail=True to opt in (e.g. if Spotify ever restores
+         the data, or if you have Extended Quota).
+    """
+    # Always select for the search phase
     name_only = _select_artist_name_targets(conn, min_plays)
+    # Only select for URI-detail phase if requested
+    rows = list(_select_artist_uri_targets(conn, refresh_older_than, min_plays)) \
+        if with_detail else []
 
     # Resolve name-only artists by search
     if name_only:
@@ -368,7 +425,10 @@ def enrich_artists(conn, client: SpotifyClient, run_id: int, refresh_older_than,
             for r in name_only:
                 try:
                     found = client.search_artist(r["name"])
-                except Exception:
+                except RateLimitError:
+                    raise  # propagate to main() — abort run cleanly
+                except Exception as e:
+                    log.warning("Search failed for %r: %s", r["name"], e)
                     progress.advance(task)
                     continue
                 if found and found.get("uri"):
@@ -442,7 +502,10 @@ def enrich_artists(conn, client: SpotifyClient, run_id: int, refresh_older_than,
             uris = [r["uri"] for r in chunk]
             try:
                 api_artists = client.get_artists(uris)
+            except RateLimitError:
+                raise  # propagate to main() — abort run cleanly
             except Exception as e:
+                log.warning("Artist batch failed (transient): %s", e)
                 console.print(f"[yellow]Artist batch failed: {e}[/yellow]")
                 progress.advance(task, len(chunk))
                 continue
@@ -500,7 +563,10 @@ def enrich_albums(conn, client: SpotifyClient, run_id: int, refresh_older_than, 
             uris = [r["uri"] for r in chunk]
             try:
                 api_albums = client.get_albums(uris)
+            except RateLimitError:
+                raise  # propagate to main() — abort run cleanly
             except Exception as e:
+                log.warning("Album batch failed (transient): %s", e)
                 console.print(f"[yellow]Album batch failed: {e}[/yellow]")
                 progress.advance(task, len(chunk))
                 continue
@@ -546,8 +612,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Enrich entities with Spotify Web API metadata")
     parser.add_argument("--tracks", action="store_true", help="Enrich tracks (do this first)")
     parser.add_argument("--albums", action="store_true", help="Enrich albums")
-    parser.add_argument("--artists", action="store_true", help="Enrich artists")
-    parser.add_argument("--all", action="store_true", help="Run all enrichment passes in correct order")
+    parser.add_argument("--artists", action="store_true",
+                        help="Run artist enrichment (search-based name resolution by default; "
+                             "add --with-artist-detail to also pull /artists/{id} fields)")
+    parser.add_argument("--all", action="store_true", help="Run tracks + albums + artist search")
+    parser.add_argument("--with-artist-detail", action="store_true",
+                        help="Also fetch /v1/artists/{id} for popularity/followers/genres. "
+                             "OFF by default: Spotify's February 2026 Dev Mode policy returns "
+                             "all-NULL for these fields, so the API call is wasted quota for "
+                             "individual developers. Enable only if you have Extended Quota "
+                             "Mode access (registered businesses with 250k+ MAU).")
     parser.add_argument("--refresh-older-than", default=None,
                         help="Re-enrich rows older than this (e.g. 90d, 4w, 24h)")
     parser.add_argument("--min-plays", type=int, default=1,
@@ -556,10 +630,38 @@ def main(argv: list[str] | None = None) -> int:
                              "~45 min), 5 (covers ~65%% of plays, ~2-3 hours).")
     parser.add_argument("--rate-interval", type=float, default=1.0,
                         help="Minimum seconds between API calls. Default 1.0 (60 req/min).")
+    parser.add_argument("--max-no-progress", type=float, default=600.0,
+                        help="Abort if no successful API response in this many seconds. "
+                             "Default 600 (10 min). Use 0 to disable. Prevents unattended "
+                             "scripts from burning hours during a sustained 429 storm.")
+    parser.add_argument("--long-penalty-threshold", type=float, default=60.0,
+                        help="If a single 429 returns Retry-After above this many seconds, "
+                             "abort immediately instead of sleeping. Default 60. Normal "
+                             "throttling sends Retry-After of 1-30s; values above this "
+                             "indicate Spotify has put the app in a penalty bucket and "
+                             "more calls would worsen the situation.")
+    parser.add_argument("--log-file", type=Path, default=None,
+                        help="Path to per-run log file. Default: auto-generated "
+                             "logs/enrich-{timestamp}.log. The log captures every 429, "
+                             "watchdog warning, and per-phase summary for post-mortem.")
+    parser.add_argument("--log-level", default="INFO",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                        help="Log level for the per-run file. Default INFO. Stdout always "
+                             "shows WARNING+ regardless.")
     args = parser.parse_args(argv)
 
     if not (args.tracks or args.albums or args.artists or args.all):
         parser.error("must specify at least one of --tracks/--albums/--artists/--all")
+
+    log_path = _configure_logging(args.log_file, args.log_level)
+    log.info("=" * 60)
+    log.info("Enrichment run starting")
+    log.info("  config: min_plays=%d rate=%.1fs max_no_progress=%.0fs "
+             "long_penalty_threshold=%.0fs",
+             args.min_plays, args.rate_interval, args.max_no_progress,
+             args.long_penalty_threshold)
+    log.info("  log file: %s", log_path)
+    console.print(f"[dim]Log file:[/dim] {log_path}")
 
     refresh = _parse_age(args.refresh_older_than)
 
@@ -569,23 +671,57 @@ def main(argv: list[str] | None = None) -> int:
                        notes=f"min_plays={args.min_plays} rate={args.rate_interval}s")
     # Enrichment hits public catalog endpoints only — Client Credentials grant
     # is correct here (no user context required, no browser/OAuth dance).
-    client = SpotifyClient(auth="app", min_request_interval=args.rate_interval)
+    client = SpotifyClient(
+        auth="app",
+        min_request_interval=args.rate_interval,
+        max_no_progress_seconds=args.max_no_progress,
+        long_penalty_threshold_seconds=args.long_penalty_threshold,
+    )
 
+    started_at = datetime.now()
     total_updated = 0
     try:
         if args.all or args.tracks:
+            log.info("Phase: tracks (begin)")
             total_updated += enrich_tracks(conn, client, run_id, refresh, args.min_plays)
+            log.info("Phase: tracks (end). cumulative updated=%d  stats=%s",
+                     total_updated, client.stats)
         if args.all or args.albums:
+            log.info("Phase: albums (begin)")
             total_updated += enrich_albums(conn, client, run_id, refresh, args.min_plays)
+            log.info("Phase: albums (end). cumulative updated=%d  stats=%s",
+                     total_updated, client.stats)
         if args.all or args.artists:
-            total_updated += enrich_artists(conn, client, run_id, refresh, args.min_plays)
+            log.info("Phase: artists (begin)  with_detail=%s", args.with_artist_detail)
+            total_updated += enrich_artists(conn, client, run_id, refresh,
+                                            args.min_plays,
+                                            with_detail=args.with_artist_detail)
+            log.info("Phase: artists (end). cumulative updated=%d  stats=%s",
+                     total_updated, client.stats)
+    except RateLimitError as e:
+        elapsed = (datetime.now() - started_at).total_seconds()
+        kind = "long-penalty" if isinstance(e, LongPenaltyError) else "watchdog"
+        log.error("Aborted (%s) after %.0fs: %s", kind, elapsed, e)
+        log.error("  final stats: %s", client.stats)
+        log.error("  rows updated before abort: %d", total_updated)
+        finish_run(conn, run_id, status="aborted",
+                   notes=f"{kind}: {e}", rows_added=total_updated)
+        console.print(f"[yellow]Aborted ({kind}):[/yellow] {e}")
+        console.print(f"[yellow]Updated {total_updated:,} row(s) before abort. "
+                      f"Log: {log_path}[/yellow]")
+        return 2
     except Exception as e:
+        log.exception("Enrichment failed unexpectedly: %s", e)
         finish_run(conn, run_id, status="failed", notes=str(e))
         console.print(f"[red]Enrichment failed:[/red] {e}")
         return 1
 
+    elapsed = (datetime.now() - started_at).total_seconds()
+    log.info("Enrichment complete. updated=%d  elapsed=%.0fs  stats=%s",
+             total_updated, elapsed, client.stats)
     finish_run(conn, run_id, status="completed", rows_added=total_updated)
     console.print(f"[green]Enrichment complete.[/green] Updated {total_updated:,} row(s).")
+    console.print(f"[dim]Stats: {client.stats}  elapsed={elapsed:.0f}s[/dim]")
     return 0
 
 

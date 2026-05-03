@@ -34,3 +34,7 @@ Thumbs.db
 # since they may contain PII (your listening habits)
 summaries/*.md
 !summaries/.gitkeep
+
+# Per-run enrichment logs — auto-generated, may contain track URIs and
+# 429 timestamps that fingerprint your Spotify dev app. Local-only.
+logs/

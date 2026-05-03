@@ -16,6 +16,7 @@ import base64
 import hashlib
 import http.server
 import json
+import logging
 import os
 import secrets
 import socketserver
@@ -27,6 +28,8 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import requests
+
+log = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TOKEN_PATH = PROJECT_ROOT / ".spotify_token.json"
@@ -52,12 +55,46 @@ class SpotifyAuthError(Exception):
     pass
 
 
+class RateLimitError(Exception):
+    """Base class for rate-limit conditions that should abort the run cleanly.
+
+    Catch this in your top-level run loop and exit with a clear message —
+    do NOT catch it in per-batch try/except, or you'll silently keep
+    spinning through the queue while the API is asking you to back off.
+    """
+    pass
+
+
+class SustainedRateLimitError(RateLimitError):
+    """No successful API response in `max_no_progress_seconds`.
+
+    Fires when the cumulative effect of 429s, 5xx errors, or timeouts has
+    starved out forward progress for too long. Default threshold: 600s.
+    """
+    pass
+
+
+class LongPenaltyError(RateLimitError):
+    """Single 429 with Retry-After above `long_penalty_threshold_seconds`.
+
+    A short Retry-After (1-30s) is normal throttle. A long one (60s+) means
+    Spotify has put the app in a penalty bucket — making more calls during
+    this window risks extending or worsening the penalty. We bail immediately
+    instead of sleeping and retrying.
+
+    Default threshold: 60s. Override with --long-penalty-threshold.
+    """
+    pass
+
+
 class SpotifyClient:
     def __init__(self, client_id: str | None = None, client_secret: str | None = None,
                  redirect_uri: str | None = None, scopes: str = DEFAULT_SCOPES,
                  auth: str = "user",
                  user_agent: str = "TheDeLay-Music-Data/0.1 (personal listening archive)",
-                 min_request_interval: float = 1.0):
+                 min_request_interval: float = 1.0,
+                 max_no_progress_seconds: float = 600.0,
+                 long_penalty_threshold_seconds: float = 60.0):
         # auth="user": Authorization Code w/ PKCE — needed for /me/* and playlist mod
         # auth="app":  Client Credentials — public catalog only, no browser, unattended
         if auth not in ("user", "app"):
@@ -86,6 +123,25 @@ class SpotifyClient:
         # until this timestamp. Without this, after a 429 we'd retry the one URL
         # but immediately hammer the next URL — same bucket, same problem.
         self._backoff_until = 0.0
+        # Watchdog: timestamp of last successful API response (200/204/404).
+        # Initialized to "now" so a freshly-launched script with a dead API
+        # still aborts after max_no_progress_seconds rather than running forever.
+        self._last_progress_at = time.time()
+        self.max_no_progress_seconds = float(max_no_progress_seconds)
+        # Hard-stop threshold for a single 429's Retry-After. Above this, raise
+        # LongPenaltyError immediately rather than sleeping and retrying.
+        self.long_penalty_threshold_seconds = float(long_penalty_threshold_seconds)
+        # Half-life warning: log once per slow period when we cross 50% of the
+        # watchdog threshold without progress. Re-arms after a successful 200.
+        self._last_halflife_warn_at = 0.0
+        # Counters surfaced at end-of-run for post-mortem reporting.
+        self.stats = {
+            "calls_total": 0,
+            "calls_200": 0,
+            "calls_429": 0,
+            "calls_5xx": 0,
+            "calls_404": 0,
+        }
 
     # -------------------------------------------------------------------------
     # Token management
@@ -233,8 +289,33 @@ class SpotifyClient:
     # Generic GET with retry/backoff
     # -------------------------------------------------------------------------
     def _throttle(self) -> None:
-        """Block until both the per-call interval AND any global 429 backoff have elapsed."""
+        """Block until both the per-call interval AND any global 429 backoff have elapsed.
+
+        Also enforces the no-progress watchdog: if no successful API response has
+        been received in `max_no_progress_seconds`, raise SustainedRateLimitError
+        BEFORE sleeping. This prevents an unattended script from quietly burning
+        hours during a sustained 429 storm.
+
+        Logs a half-life WARN once per slow period when we cross 50% of the
+        watchdog threshold — provides early signal for post-mortem.
+        """
         now = time.time()
+        elapsed_since_progress = now - self._last_progress_at
+        if (self.max_no_progress_seconds > 0
+                and elapsed_since_progress > self.max_no_progress_seconds):
+            raise SustainedRateLimitError(
+                f"No successful API response in {elapsed_since_progress:.0f}s "
+                f"(threshold: {self.max_no_progress_seconds:.0f}s). "
+                f"Aborting to prevent runaway sleep."
+            )
+        # Half-life warning, fires once per slow period (resets on next 200/204/404).
+        half = self.max_no_progress_seconds / 2
+        if (half > 0 and elapsed_since_progress > half
+                and self._last_halflife_warn_at < self._last_progress_at):
+            log.warning("Watchdog half-life crossed: %.0fs without progress "
+                        "(threshold %.0fs). Something is degrading.",
+                        elapsed_since_progress, self.max_no_progress_seconds)
+            self._last_halflife_warn_at = now
         wait = max(
             self._min_interval - (now - self._last_request_at) if self._min_interval > 0 else 0,
             self._backoff_until - now,
@@ -260,30 +341,60 @@ class SpotifyClient:
                 timeout=30,
             )
             self._last_request_at = time.time()
+            self.stats["calls_total"] += 1
             if resp.status_code == 200:
+                self._last_progress_at = self._last_request_at
+                self.stats["calls_200"] += 1
                 return resp.json()
             if resp.status_code == 204:
+                self._last_progress_at = self._last_request_at
+                self.stats["calls_200"] += 1
                 return {}
             if resp.status_code == 404 and allow_404:
+                self._last_progress_at = self._last_request_at
+                self.stats["calls_404"] += 1
                 return None
             if resp.status_code == 401:
                 # Token expired between check and use; force-refresh and retry
+                log.info("401 on %s — refreshing token and retrying", path)
                 if self.auth_mode == "app":
                     self._app_token = None
                 else:
                     self._token = None
                 continue
             if resp.status_code == 429:
-                wait = int(resp.headers.get("Retry-After", "10"))
-                # Global backoff: every subsequent call sees this too.
-                # Cap at 5 minutes per single 429 to prevent a single bad
-                # response from stalling forever.
-                wait = min(wait, 300)
+                self.stats["calls_429"] += 1
+                retry_after = int(resp.headers.get("Retry-After", "10"))
+                # Long-penalty hard stop: a Retry-After above the threshold means
+                # Spotify has put us in a penalty bucket. Don't sleep through it —
+                # making more calls during this window risks worse penalties.
+                # Bail out cleanly so the caller can resume manually after the
+                # cooldown expires.
+                if retry_after > self.long_penalty_threshold_seconds:
+                    log.error("429 on %s with Retry-After=%ds (>%.0fs threshold). "
+                              "Spotify cooldown — aborting run.",
+                              path, retry_after,
+                              self.long_penalty_threshold_seconds)
+                    raise LongPenaltyError(
+                        f"Spotify returned 429 with Retry-After={retry_after}s "
+                        f"(~{retry_after/3600:.1f}h). This indicates a long-window "
+                        f"penalty bucket. Aborting now to prevent extending the "
+                        f"penalty. Wait at least {retry_after}s before re-running."
+                    )
+                # Short Retry-After: normal throttle. Sleep, retry, but cap at
+                # 300s so a misbehaving server can't stall a single attempt forever.
+                wait = min(retry_after, 300)
+                log.warning("429 on %s  Retry-After=%ds  attempt=%d/5  (sleeping %ds)",
+                            path, retry_after, attempt + 1, wait)
                 self._backoff_until = max(self._backoff_until, time.time() + wait)
                 time.sleep(wait)
                 continue
             if 500 <= resp.status_code < 600:
-                time.sleep(2 ** attempt)
+                self.stats["calls_5xx"] += 1
+                backoff = 2 ** attempt
+                log.warning("%d on %s  attempt=%d/5  (sleeping %ds)",
+                            resp.status_code, path, attempt + 1, backoff)
+                time.sleep(backoff)
                 continue
             resp.raise_for_status()
         raise RuntimeError(f"giving up on {url} after retries")
