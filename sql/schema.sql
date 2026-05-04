@@ -389,6 +389,56 @@ JOIN plays p ON p.track_id = t.track_id
 WHERE p.content_type = 'track'
 GROUP BY ar.artist_id, ar.spotify_artist_uri, ar.name, ar.genres_json;
 
+-- -----------------------------------------------------------------------------
+-- v_track_engagement
+-- -----------------------------------------------------------------------------
+-- Per-track engagement aggregates for the love-score engine.
+-- Computes quality plays (≥ threshold % listened), backbutton replays,
+-- recent quality plays, and raw engagement stats. Only includes tracks
+-- that have duration_ms (i.e. have been enriched via the Spotify API).
+--
+-- The score.py script reads from this view and layers on the more complex
+-- computations (skip-streak detection) that need Python.
+-- -----------------------------------------------------------------------------
+DROP VIEW IF EXISTS v_track_engagement;
+CREATE VIEW v_track_engagement AS
+SELECT
+    t.track_id,
+    t.spotify_track_uri,
+    t.name AS track_name,
+    t.duration_ms,
+    a.name AS album_name,
+    a.release_year,
+    pa.name AS primary_artist_name,
+    COUNT(p.play_id) AS total_plays,
+    -- Quality plays: listened to ≥ 80% of the track
+    SUM(CASE WHEN p.ms_played * 1.0 / t.duration_ms >= 0.80 THEN 1 ELSE 0 END) AS quality_plays,
+    -- Recent quality plays: quality plays in last 90 days
+    SUM(CASE WHEN p.ts >= datetime('now', '-90 days')
+              AND p.ms_played * 1.0 / t.duration_ms >= 0.80 THEN 1 ELSE 0 END) AS recent_quality,
+    -- Back-button replays: strongest love signal
+    SUM(CASE WHEN p.reason_end = 'backbtn' THEN 1 ELSE 0 END) AS backbutton_count,
+    -- Recent plays (any engagement level, last 90 days)
+    SUM(CASE WHEN p.ts >= datetime('now', '-90 days') THEN 1 ELSE 0 END) AS recent_plays,
+    -- Deliberate quality: you chose it (clickrow) AND finished it (≥80%)
+    -- This is the "I know when I want this song" signal
+    SUM(CASE WHEN p.reason_start = 'clickrow'
+              AND p.ms_played * 1.0 / t.duration_ms >= 0.80 THEN 1 ELSE 0 END) AS deliberate_quality,
+    -- Skips (Spotify's own flag)
+    SUM(CASE WHEN p.skipped = 1 THEN 1 ELSE 0 END) AS skip_count,
+    -- Average percent played (capped at 100%)
+    AVG(ROUND(100.0 * MIN(p.ms_played, t.duration_ms) / t.duration_ms, 1)) AS avg_pct_played,
+    MIN(p.ts) AS first_played,
+    MAX(p.ts) AS last_played
+FROM tracks t
+JOIN plays p ON p.track_id = t.track_id AND p.content_type = 'track'
+LEFT JOIN albums a ON t.album_id = a.album_id
+LEFT JOIN track_artists ta ON t.track_id = ta.track_id AND ta.position = 0
+LEFT JOIN artists pa ON ta.artist_id = pa.artist_id
+WHERE t.duration_ms IS NOT NULL AND t.duration_ms > 0
+GROUP BY t.track_id, t.spotify_track_uri, t.name, t.duration_ms,
+         a.name, a.release_year, pa.name;
+
 -- =============================================================================
 -- SCHEMA VERSION  (for future migrations)
 -- =============================================================================
@@ -648,4 +698,4 @@ LEFT JOIN artist_labels arl
     ON arl.artist_id = ta.artist_id AND arl.label_key = ak.label_key;
 
 -- Bump schema version
-INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', '2');
+INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', '3');
