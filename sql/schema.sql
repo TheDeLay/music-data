@@ -697,5 +697,50 @@ LEFT JOIN track_artists ta
 LEFT JOIN artist_labels arl
     ON arl.artist_id = ta.artist_id AND arl.label_key = ak.label_key;
 
+-- =============================================================================
+-- LISTENING CONTEXTS (mode classification)
+-- =============================================================================
+-- Algorithm-discovered + user-named clusters of listening behavior.
+-- Each cluster groups plays with similar time-of-day / day-of-week patterns
+-- (e.g. "weekday mornings", "weekend evenings"). Tracks are associated with
+-- one or more contexts via track_context_affinity.
+--
+-- Populated by scripts/cluster_modes.py (algorithm) and scripts/label_modes.py
+-- (interactive labeling). The clustering is per-listener — see Phase-0 of
+-- the engagement-model spec for shared-account handling.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS listening_contexts (
+    context_id INTEGER PRIMARY KEY,
+    cluster_id INTEGER NOT NULL UNIQUE,    -- algorithm-assigned label (0, 1, 2, ...)
+    user_label TEXT NOT NULL DEFAULT '',   -- user-provided name; empty until labeled
+    centroid_hour_cos REAL,                -- cluster centroid in feature space; nullable
+    centroid_hour_sin REAL,                --   for backward compat with older runs
+    centroid_is_weekend REAL,
+    play_count INTEGER NOT NULL DEFAULT 0, -- # plays assigned to this cluster (denormalized)
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- -----------------------------------------------------------------------------
+-- track_context_affinity
+-- -----------------------------------------------------------------------------
+-- Per-track, per-context score of how strongly a track belongs to that
+-- listening context. affinity = (plays of track in cluster) / (total plays
+-- of track). is_primary marks the highest-affinity context if it clears the
+-- primary-threshold (default 0.50). Tracks below threshold are "all-context"
+-- (no row marked primary).
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS track_context_affinity (
+    track_id INTEGER NOT NULL,
+    context_id INTEGER NOT NULL,
+    affinity REAL NOT NULL,
+    is_primary INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (track_id, context_id),
+    FOREIGN KEY (track_id) REFERENCES tracks(track_id) ON DELETE CASCADE,
+    FOREIGN KEY (context_id) REFERENCES listening_contexts(context_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_tca_track ON track_context_affinity(track_id);
+CREATE INDEX IF NOT EXISTS idx_tca_context ON track_context_affinity(context_id);
+
 -- Bump schema version
-INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', '3');
+INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', '4');
