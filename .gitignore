@@ -24,9 +24,8 @@ data/*.db-shm
 .DS_Store
 Thumbs.db
 
-# FUSE/SyncThing shadow files — created when a file is unlinked while still
-# open by another process (common when SyncThing replicates over a file
-# something else is reading). Harmless leftovers; should never be committed.
+# FUSE shadow files — created when a file is unlinked while still
+# open by another process. Harmless leftovers; should never be committed.
 .fuse_hidden*
 
 # Editors

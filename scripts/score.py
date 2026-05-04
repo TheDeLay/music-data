@@ -217,7 +217,7 @@ def score_tracks(conn: sqlite3.Connection, config: ScoreConfig) -> list[TrackSco
             ts.deliberate_quality = td["deliberate_quality"]
 
     # Step 3: per-play data for skip-streak detection
-    # One query per track is fine for ~907 tracks
+    # One query per track is fine at personal-library scale
     for ts in tracks:
         plays = conn.execute("""
             SELECT p.ms_played, t.duration_ms, p.ts
