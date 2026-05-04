@@ -142,6 +142,21 @@ Since May 15, 2025, Extended Quota Mode requires:
 
 There is no upgrade path for individual developers. Dev Mode is the ceiling. If your use case requires volume the daily quota can't support, you need either a registered business entity at scale or a different data source.
 
+### What about Apple Music, Amazon Music, or YouTube Music?
+
+This pipeline is built specifically around **Spotify's** data export and Web API. The framework is portable in principle — the schema is platform-agnostic and only the extractor layer is Spotify-specific — but practical fidelity varies by service:
+
+| Platform | Export quality | Engagement fidelity |
+|---|---|---|
+| **Spotify** (this repo) | Excellent: per-play timestamps, `reason_start`/`reason_end`, `ms_played`, shuffle/skip flags | Full |
+| **Apple Music** | Decent: privacy export covers library + play history | Partial — no per-play back-button or skip distinction |
+| **YouTube Music** | Sparse: available via Google Takeout but listing-style | Weak — degrades to recency + play count |
+| **Amazon Music** | Thin: typically aggregated, not per-event | Weakest of the four |
+
+The engagement model that motivates this project — finish rate, back-button gold, skip-streak detection — depends on Spotify's per-play telemetry. Other platforms' exports lose those signals; the love score on those platforms collapses to a recency-weighted play count, which is better than nothing but isn't the project's central pitch.
+
+If you want to contribute an Apple / Amazon / YouTube extractor, open an issue. For now, this repo is Spotify-only.
+
 ### What this means in practice
 
 - **Keep Premium active.** As long as you want to run this pipeline.
