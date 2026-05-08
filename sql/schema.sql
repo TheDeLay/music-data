@@ -776,5 +776,47 @@ CREATE INDEX IF NOT EXISTS idx_ac_artist ON artist_classifications(artist_id);
 CREATE INDEX IF NOT EXISTS idx_ac_classification ON artist_classifications(classification);
 
 
+-- =============================================================================
+-- MUSICBRAINZ + ACOUSTICBRAINZ ENRICHMENT
+-- =============================================================================
+-- Two-phase pipeline: (1) resolve track ISRC to a MusicBrainz Recording ID,
+-- (2) use that MBID to fetch low-/high-level audio features from
+-- AcousticBrainz. AcousticBrainz stopped accepting new submissions in Feb
+-- 2022 and the dataset is frozen — coverage is good for older recordings,
+-- sparse for 2022+.
+--
+-- Both tables follow the same idempotency pattern: a row is inserted for
+-- every track we've attempted to look up, including misses. A NULL
+-- mb_recording_id (or not_found=1 in the features table) means "looked up,
+-- nothing there" and the resume logic uses presence-of-row to skip retries.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS mb_recordings (
+    track_id INTEGER PRIMARY KEY,
+    mb_recording_id TEXT,                  -- NULL if ISRC didn't resolve
+    fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (track_id) REFERENCES tracks(track_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_mbr_mbid ON mb_recordings(mb_recording_id);
+
+
+CREATE TABLE IF NOT EXISTS acousticbrainz_features (
+    track_id INTEGER PRIMARY KEY,
+    bpm REAL,                              -- low-level rhythm.bpm
+    energy REAL,                           -- 0-1 (low-level lowlevel.average_loudness, normalized)
+    valence REAL,                          -- 0-1 (high-level mood_happy probability)
+    danceability REAL,                     -- 0-1 (high-level danceability)
+    instrumental REAL,                     -- 0-1 (high-level voice_instrumental, instrumental probability)
+    key INTEGER,                           -- 0-11 pitch class, NULL if unknown
+    mode INTEGER,                          -- 0=minor, 1=major, NULL if unknown
+    not_found INTEGER NOT NULL DEFAULT 0,  -- 1 = MBID exists but AB has no data; don't retry
+    fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (track_id) REFERENCES tracks(track_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_abf_bpm ON acousticbrainz_features(bpm);
+CREATE INDEX IF NOT EXISTS idx_abf_valence ON acousticbrainz_features(valence);
+
+
 -- Bump schema version
-INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', '5');
+INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', '6');
