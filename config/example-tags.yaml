@@ -1,0 +1,38 @@
+# Example tag rules for scripts/classify_artists.py
+#
+# Each rule maps a substring pattern to a tag. Patterns are matched
+# case-insensitively against the artist's name (via name_normalized).
+# An artist whose name contains the pattern receives the tag in the
+# artist_classifications table.
+#
+# Tag names are entirely up to you — the engine treats them as opaque
+# strings. Use whatever taxonomy is useful for your playlist filtering:
+# label affiliation, ensemble type, era, mood, language, or anything else.
+#
+# This file is intentionally tiny and illustrative. Copy it to a personal
+# config file (e.g. config/my-tags.yaml — gitignored) and expand for your
+# own library.
+#
+# Run:
+#   python -m scripts.classify_artists --rules config/example-tags.yaml --dry-run
+#   python -m scripts.classify_artists --rules config/example-tags.yaml
+
+rules:
+  # Ensemble-type tags — useful for filtering classical/jazz playlists
+  - pattern: "Symphony Orchestra"
+    tag: "orchestral"
+  - pattern: "Philharmonic"
+    tag: "orchestral"
+  - pattern: "String Quartet"
+    tag: "ensemble-quartet"
+  - pattern: "Big Band"
+    tag: "big-band"
+
+  # Project-type tags
+  - pattern: "Soundtrack"
+    tag: "soundtrack"
+
+# Pattern-writing tip: keep patterns long enough to avoid false positives.
+# A pattern like "OST" would match "Costa", "Acosta", and dozens of other
+# unrelated names. Prefer specific, multi-word patterns where possible,
+# and use --dry-run to preview matches before committing to a rule.

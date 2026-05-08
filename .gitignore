@@ -42,3 +42,9 @@ summaries/*.md
 # Per-run enrichment logs — auto-generated, may contain track URIs and
 # 429 timestamps that fingerprint your Spotify dev app. Local-only.
 logs/
+
+# Personal classifier rules — your taxonomy is yours. Only the public
+# example file is committed. Copy it to config/my-tags.yaml (or any
+# other name) and git will leave your personal rules alone.
+config/*.yaml
+!config/example-tags.yaml

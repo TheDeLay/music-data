@@ -742,5 +742,39 @@ CREATE TABLE IF NOT EXISTS track_context_affinity (
 CREATE INDEX IF NOT EXISTS idx_tca_track ON track_context_affinity(track_id);
 CREATE INDEX IF NOT EXISTS idx_tca_context ON track_context_affinity(context_id);
 
+
+-- =============================================================================
+-- ARTIST CLASSIFICATIONS (user-defined tags)
+-- =============================================================================
+-- Generic per-artist tagging system. Each row attaches one user-defined tag
+-- to one artist, recorded with the method that produced it. The taxonomy is
+-- entirely user-driven — the engine treats `classification` as an opaque
+-- string. Typical tags might describe label affiliation, era, ensemble type,
+-- mood, or any other category the user finds useful for playlist filtering.
+--
+-- Populated by scripts/classify_artists.py from a user-supplied YAML of
+-- (pattern, tag) rules. Rules match case-insensitively against artists.name
+-- (via name_normalized). Idempotent: re-running with method='label_match'
+-- replaces all label_match rows; rows from other methods (e.g. 'manual')
+-- are preserved.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS artist_classifications (
+    artist_id INTEGER NOT NULL,
+    classification TEXT NOT NULL,        -- user-defined tag, e.g. 'major-label',
+                                         --   'orchestral', 'mood-upbeat'
+    method TEXT NOT NULL,                -- how this tag was assigned:
+                                         --   'label_match' (curated YAML),
+                                         --   'manual' (user-edited),
+                                         --   future: 'llm_lyrics', etc.
+    confidence REAL NOT NULL DEFAULT 1.0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (artist_id, classification, method),
+    FOREIGN KEY (artist_id) REFERENCES artists(artist_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_ac_artist ON artist_classifications(artist_id);
+CREATE INDEX IF NOT EXISTS idx_ac_classification ON artist_classifications(classification);
+
+
 -- Bump schema version
-INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', '4');
+INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', '5');
