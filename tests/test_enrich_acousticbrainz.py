@@ -228,6 +228,31 @@ class TestStatusCodes:
             client.get("/x")
         assert client.stats["calls_network_err"] == 5
 
+    def test_400_returns_none_no_retry(self):
+        """Regression: a 400 on one bad URL should not crash the run.
+
+        Real-world trigger (2026-05-08): MusicBrainz returned 400 on a
+        lowercase ISRC, propagating an HTTPError that aborted the script
+        with state at 726/907."""
+        client, session, _ = _make_client(MB_API, responses=[
+            FakeResponse(400),
+            FakeResponse(200, {"should-not-be-reached": True}),
+        ])
+        assert client.get("/bad-input") is None
+        assert client.stats["calls_4xx_other"] == 1
+        # Only the first response was consumed — no retry on 4xx
+        assert len(session.calls) == 1
+
+    def test_410_and_422_also_treated_as_miss(self):
+        """Any 4xx-other-than-404-or-429 is a permanent miss."""
+        client, _, _ = _make_client(MB_API, responses=[FakeResponse(410)])
+        assert client.get("/gone") is None
+        assert client.stats["calls_4xx_other"] == 1
+
+        client2, _, _ = _make_client(MB_API, responses=[FakeResponse(422)])
+        assert client2.get("/unprocessable") is None
+        assert client2.stats["calls_4xx_other"] == 1
+
 
 class TestWatchdog:
 
@@ -266,6 +291,24 @@ class TestLookupMbid:
     def test_404_returns_none(self):
         client, _, _ = _make_client(MB_API, responses=[FakeResponse(404)])
         assert lookup_mbid(client, "BADISRC") is None
+
+    def test_lowercase_isrc_normalized_before_send(self):
+        """Real-world ISRC `ushm81940922` from a Spotify export was
+        rejected by MB with 400. lookup_mbid should uppercase first."""
+        client, session, _ = _make_client(MB_API, responses=[
+            FakeResponse(200, {"recordings": [{"id": "ok-mbid"}]}),
+        ])
+        assert lookup_mbid(client, "ushm81940922") == "ok-mbid"
+        # The actual URL should contain the uppercase form
+        sent_url = session.calls[0][0]
+        assert "USHM81940922" in sent_url
+        assert "ushm81940922" not in sent_url
+
+    def test_empty_isrc_returns_none_without_call(self):
+        client, session, _ = _make_client(MB_API, responses=[])
+        assert lookup_mbid(client, "") is None
+        assert lookup_mbid(client, "   ") is None
+        assert session.calls == []  # no API call attempted
 
 
 # ---------------------------------------------------------------------------

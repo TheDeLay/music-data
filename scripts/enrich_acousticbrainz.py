@@ -110,6 +110,7 @@ class ThrottledClient:
             "calls_200": 0,
             "calls_404": 0,
             "calls_429": 0,
+            "calls_4xx_other": 0,
             "calls_5xx": 0,
             "calls_network_err": 0,
         }
@@ -192,6 +193,17 @@ class ThrottledClient:
                 self._sleep(backoff)
                 continue
 
+            # Any other 4xx (400, 410, 422, etc.) is a permanent miss for this
+            # specific URL — retrying won't help. Log + treat like 404 so a
+            # single bad piece of data (e.g. a malformed ISRC) doesn't kill an
+            # otherwise-healthy unattended run.
+            if 400 <= resp.status_code < 500:
+                self._last_progress_at = self._last_request_at
+                self.stats["calls_4xx_other"] += 1
+                log.warning("%d on %s — treating as miss (no retry)",
+                            resp.status_code, path)
+                return None
+
             resp.raise_for_status()
         raise RuntimeError(f"giving up on {url} after retries")
 
@@ -207,8 +219,15 @@ def lookup_mbid(client: ThrottledClient, isrc: str) -> Optional[str]:
     we just take the first — for audio-feature lookup this is good enough,
     since AB features are per-recording but the actual audio is usually
     the same across re-releases.
+
+    ISRCs are uppercased + stripped before sending: ISO 3901 specifies
+    uppercase, and MusicBrainz returns 400 on lowercase input. The Spotify
+    privacy export occasionally contains lowercase ISRCs.
     """
-    data = client.get(f"/isrc/{isrc}", params={"fmt": "json"})
+    normalized = (isrc or "").strip().upper()
+    if not normalized:
+        return None
+    data = client.get(f"/isrc/{normalized}", params={"fmt": "json"})
     if data is None:
         return None
     recs = data.get("recordings") or []
