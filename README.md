@@ -240,6 +240,30 @@ If anything crashes hard, just re-run — Phase 1 skips ISRCs already in `mb_rec
 - **BPM doubling.** AcousticBrainz sometimes reports double the actual tempo (e.g. an 80 BPM song shown as 160). It's detecting the half-time backbeat as the beat. If you see suspicious clusters at BPM 178-180 in your data, halve them mentally.
 - **Frozen dataset bias.** The 28% of MBIDs that AB returns 404 for are disproportionately newer releases. If your library skews toward 2022+ music, expect lower end-to-end coverage than the numbers above.
 
+### Using the features in playlists
+
+Once `acousticbrainz_features` is populated, `scripts.playlist` can filter by any combination of audio dimensions in the same query that filters by love score and listening context:
+
+```bash
+# Upbeat happy tracks I love
+python -m scripts.playlist --bpm-min 120 --valence-min 0.6 --love-min 5
+
+# Slow + minor-key for a contemplative mood
+python -m scripts.playlist --bpm-max 90 --key-mode minor --top 20
+
+# Late-night affirmative tracks (combines mode clustering + audio)
+python -m scripts.playlist --mode "late night" --love-min 5 --valence-min 0.5
+
+# G-major instrumental only
+python -m scripts.playlist --key 7 --key-mode major --instrumental-min 0.5
+```
+
+Available filters: `--bpm-min/max`, `--valence-min/max`, `--energy-min/max`, `--danceability-min/max`, `--instrumental-min`, `--key 0..11`, `--key-mode major|minor`. Pitch class numbering: `0=C 1=C# 2=D 3=D# 4=E 5=F 6=F# 7=G 8=G# 9=A 10=A# 11=B`.
+
+When any feature filter is active, the table output adds BPM/Valence/Energy/Danceability/Key columns automatically. Use `--show-features` to add them without filtering. JSON output includes a full `audio_features` sub-object on every track when features were loaded.
+
+**NULL handling:** any active feature filter excludes tracks without that feature — same as standard SQL `WHERE` semantics. Asking for `--bpm-min 120` on a track with unknown BPM means "doesn't satisfy", not "pass through". If you want to keep tracks without features in the result, just don't apply that filter.
+
 ---
 
 ## How it works
