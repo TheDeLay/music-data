@@ -201,6 +201,47 @@ The defaults are deliberately conservative. If you're impatient, you can lower `
 
 ---
 
+## Optional: enrich with audio features (BPM, key, valence)
+
+Once tracks have ISRCs populated (a byproduct of `scripts.enrich`), you can chain through MusicBrainz and AcousticBrainz for tempo, key, mode, and mood probabilities. Both APIs are open data — no auth, no quotas, just polite throttling.
+
+```bash
+python -m scripts.enrich_acousticbrainz --min-plays 5
+```
+
+Two phases run sequentially, both idempotent and resume-safe:
+
+1. **Phase 1 — ISRC → MusicBrainz Recording UUID.** Cached in `mb_recordings`.
+2. **Phase 2 — MBID → AcousticBrainz features.** Fetches low-level (BPM, key, mode, average loudness) and high-level (mood_happy probability, danceability, voice_instrumental). Cached in `acousticbrainz_features`.
+
+### What to expect
+
+**AcousticBrainz stopped accepting new submissions in February 2022**, so the dataset is frozen. Coverage is solid for older recordings, sparse for 2022+ releases.
+
+Real-world numbers from one author's library (907 tier-1 ISRC tracks, mostly pre-2020):
+
+- **MusicBrainz resolution rate: ~65%** of ISRCs resolved to a recording UUID
+- **AcousticBrainz feature rate: ~72%** of those MBIDs had feature data
+- **End-to-end: ~46%** of ISRC tracks ended up with full audio features
+
+Wall-clock per phase, from the same run:
+
+| Phase | Calls per track | Effective sec/call | Per 100 ISRCs |
+|---|---|---|---|
+| Phase 1 (MusicBrainz) | 1 | ~5 sec | ~8 min |
+| Phase 2 (AcousticBrainz) | 2 (low-level + high-level) | ~1.3 sec | ~4 min |
+
+**Plan on roughly one minute per 10 ISRC tracks total wall-clock.** A ~900-ISRC library finishes in ~75 minutes when the network is cooperative. MusicBrainz is the slower, flakier of the two APIs — expect occasional read timeouts and 5xx blips on Phase 1 (the script retries with exponential backoff). Phase 2 is consistently fast and clean.
+
+If anything crashes hard, just re-run — Phase 1 skips ISRCs already in `mb_recordings`, Phase 2 skips MBIDs already in `acousticbrainz_features`.
+
+### Known artifacts
+
+- **BPM doubling.** AcousticBrainz sometimes reports double the actual tempo (e.g. an 80 BPM song shown as 160). It's detecting the half-time backbeat as the beat. If you see suspicious clusters at BPM 178-180 in your data, halve them mentally.
+- **Frozen dataset bias.** The 28% of MBIDs that AB returns 404 for are disproportionately newer releases. If your library skews toward 2022+ music, expect lower end-to-end coverage than the numbers above.
+
+---
+
 ## How it works
 
 Three layers, by design:
