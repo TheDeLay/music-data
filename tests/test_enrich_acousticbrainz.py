@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import requests
 
 from scripts.enrich_acousticbrainz import (
     AB_API,
@@ -71,7 +72,12 @@ class FakeSession:
         self.calls.append((url, params))
         if not self.responses:
             raise RuntimeError(f"FakeSession exhausted (called {url})")
-        return self.responses.pop(0)
+        item = self.responses.pop(0)
+        # Allow tests to simulate network-layer errors by queuing exceptions
+        # as response items.
+        if isinstance(item, Exception):
+            raise item
+        return item
 
 
 class FakeClock:
@@ -185,6 +191,42 @@ class TestStatusCodes:
         assert client.stats["calls_5xx"] == 2
         # Two backoff sleeps (2^0=1, 2^1=2) — exponential
         assert clock.sleep_calls.count(1) >= 1 or any(s >= 1 for s in clock.sleep_calls)
+
+    def test_read_timeout_retries(self):
+        """A ReadTimeout on call N should be retried, not crash the run.
+
+        Regression: an unhandled requests.exceptions.ReadTimeout aborted
+        the first real run after 582 successful calls (2026-05-08).
+        """
+        client, _, _ = _make_client(MB_API, responses=[
+            requests.exceptions.ReadTimeout("simulated MB hang"),
+            FakeResponse(200, {"recovered": True}),
+        ])
+        result = client.get("/x")
+        assert result == {"recovered": True}
+        assert client.stats["calls_network_err"] == 1
+        assert client.stats["calls_200"] == 1
+
+    def test_connection_error_retries(self):
+        client, _, _ = _make_client(MB_API, responses=[
+            requests.exceptions.ConnectionError("simulated TCP reset"),
+            FakeResponse(200, {"ok": True}),
+        ])
+        assert client.get("/x") == {"ok": True}
+        assert client.stats["calls_network_err"] == 1
+
+    def test_network_error_eventually_gives_up(self):
+        """5 consecutive network errors -> RuntimeError (giving up)."""
+        client, _, _ = _make_client(MB_API, responses=[
+            requests.exceptions.ReadTimeout("1"),
+            requests.exceptions.ReadTimeout("2"),
+            requests.exceptions.ReadTimeout("3"),
+            requests.exceptions.ReadTimeout("4"),
+            requests.exceptions.ReadTimeout("5"),
+        ])
+        with pytest.raises(RuntimeError, match="giving up"):
+            client.get("/x")
+        assert client.stats["calls_network_err"] == 5
 
 
 class TestWatchdog:

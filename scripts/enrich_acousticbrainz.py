@@ -111,6 +111,7 @@ class ThrottledClient:
             "calls_404": 0,
             "calls_429": 0,
             "calls_5xx": 0,
+            "calls_network_err": 0,
         }
 
     def _throttle(self) -> None:
@@ -139,7 +140,22 @@ class ThrottledClient:
         url = path if path.startswith("http") else f"{self.base_url}{path}"
         for attempt in range(5):
             self._throttle()
-            resp = self._session.get(url, params=params, timeout=30)
+            try:
+                resp = self._session.get(url, params=params, timeout=30)
+            except (requests.exceptions.Timeout,
+                    requests.exceptions.ConnectionError) as e:
+                # Network-layer error (DNS, TCP reset, read timeout, SSL).
+                # Treat as transient: exponential backoff and retry. The
+                # watchdog (max_no_progress_seconds) is the safety net if
+                # nothing recovers.
+                self._last_request_at = self._now()
+                self.stats["calls_total"] += 1
+                self.stats["calls_network_err"] += 1
+                backoff = 2 ** attempt
+                log.warning("Network error on %s: %s  attempt=%d/5  (sleeping %ds)",
+                            path, type(e).__name__, attempt + 1, backoff)
+                self._sleep(backoff)
+                continue
             self._last_request_at = self._now()
             self.stats["calls_total"] += 1
 
