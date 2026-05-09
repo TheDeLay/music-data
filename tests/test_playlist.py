@@ -21,10 +21,13 @@ import pytest
 
 from scripts.playlist import (
     EMPTY_MSG,
+    FeatureFilter,
     ModeNotFoundError,
     PlaylistConfig,
     build_playlist,
     filter_by_context,
+    filter_by_features,
+    load_features_for_tracks,
     print_json,
     print_table,
     print_uris,
@@ -166,6 +169,22 @@ def full_db(tmp_path):
         "INSERT INTO track_context_affinity "
         "(track_id, context_id, affinity, is_primary) VALUES (?, ?, ?, ?)",
         affinities,
+    )
+
+    # Audio features — Track 4 "Rare Gem" deliberately has NO features so
+    # we can test the NULL-exclusion behavior of filters.
+    features = [
+        # (track_id, bpm, energy, valence, danceability, instrumental, key, mode)
+        (1, 130.0, 0.60, 0.70, 0.50, 0.10, 0, 1),    # Morning: upbeat happy C-major
+        (2,  80.0, 0.40, 0.30, 0.40, 0.20, 9, 0),    # Night Owl: slow sad A-minor
+        (3, 100.0, 0.50, 0.50, 0.50, 0.50, 5, 1),    # All Context: mid F-major
+        (5, 150.0, 0.70, 0.20, 0.60, 0.05, 3, 0),    # Falling Out: fast sad D#-minor
+    ]
+    conn.executemany(
+        "INSERT INTO acousticbrainz_features "
+        "(track_id, bpm, energy, valence, danceability, instrumental, key, mode, not_found) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+        features,
     )
     conn.commit()
     yield conn
@@ -398,6 +417,251 @@ class TestOutputFormats:
         captured = capsys.readouterr()
         assert captured.out == ""             # stdout clean — file would be empty
         assert EMPTY_MSG in captured.err      # message visible in terminal
+
+
+# ---------------------------------------------------------------------------
+# FeatureFilter dataclass
+# ---------------------------------------------------------------------------
+class TestFeatureFilter:
+
+    def test_default_is_inactive(self):
+        assert FeatureFilter().is_active() is False
+
+    def test_any_field_set_makes_active(self):
+        assert FeatureFilter(bpm_min=120).is_active() is True
+        assert FeatureFilter(valence_max=0.5).is_active() is True
+        assert FeatureFilter(key=7).is_active() is True
+        assert FeatureFilter(key_mode=1).is_active() is True
+
+    def test_zero_value_counts_as_active(self):
+        """Edge case: bpm_min=0 is technically a no-op but the user did
+        set the field, so the filter is active."""
+        assert FeatureFilter(bpm_min=0).is_active() is True
+
+
+# ---------------------------------------------------------------------------
+# filter_by_features
+# ---------------------------------------------------------------------------
+class TestFilterByFeatures:
+
+    def _all_tracks(self, db):
+        return score_tracks(db, _make_score_config())
+
+    def test_no_filter_returns_input_unchanged(self, full_db):
+        tracks = self._all_tracks(full_db)
+        result = filter_by_features(tracks, full_db, FeatureFilter())
+        assert result == tracks
+
+    def test_bpm_min_excludes_below(self, full_db):
+        tracks = self._all_tracks(full_db)
+        result = filter_by_features(tracks, full_db, FeatureFilter(bpm_min=120))
+        names = {t.track_name for t in result}
+        # Tracks with BPM >= 120: Morning (130), Falling Out (150). Track 4
+        # has no features → excluded.
+        assert names == {"Morning Anthem", "Falling Out"}
+
+    def test_bpm_max_excludes_above(self, full_db):
+        tracks = self._all_tracks(full_db)
+        result = filter_by_features(tracks, full_db, FeatureFilter(bpm_max=100))
+        names = {t.track_name for t in result}
+        # BPM <= 100: Night Owl (80), All Context (100)
+        assert names == {"Night Owl", "All Context"}
+
+    def test_bpm_range(self, full_db):
+        tracks = self._all_tracks(full_db)
+        result = filter_by_features(tracks, full_db,
+                                    FeatureFilter(bpm_min=90, bpm_max=140))
+        names = {t.track_name for t in result}
+        # 90 <= BPM <= 140: All Context (100), Morning (130)
+        assert names == {"All Context", "Morning Anthem"}
+
+    def test_valence_min(self, full_db):
+        tracks = self._all_tracks(full_db)
+        result = filter_by_features(tracks, full_db,
+                                    FeatureFilter(valence_min=0.6))
+        names = {t.track_name for t in result}
+        # valence >= 0.6: Morning (0.7) only
+        assert names == {"Morning Anthem"}
+
+    def test_valence_max(self, full_db):
+        tracks = self._all_tracks(full_db)
+        result = filter_by_features(tracks, full_db,
+                                    FeatureFilter(valence_max=0.4))
+        names = {t.track_name for t in result}
+        # valence <= 0.4: Night Owl (0.3), Falling Out (0.2)
+        assert names == {"Night Owl", "Falling Out"}
+
+    def test_key_exact_match(self, full_db):
+        tracks = self._all_tracks(full_db)
+        # Key 9 = A. Only Night Owl is in A.
+        result = filter_by_features(tracks, full_db, FeatureFilter(key=9))
+        names = {t.track_name for t in result}
+        assert names == {"Night Owl"}
+
+    def test_key_mode_major(self, full_db):
+        tracks = self._all_tracks(full_db)
+        result = filter_by_features(tracks, full_db, FeatureFilter(key_mode=1))
+        names = {t.track_name for t in result}
+        # Major: Morning (C), All Context (F)
+        assert names == {"Morning Anthem", "All Context"}
+
+    def test_key_mode_minor(self, full_db):
+        tracks = self._all_tracks(full_db)
+        result = filter_by_features(tracks, full_db, FeatureFilter(key_mode=0))
+        names = {t.track_name for t in result}
+        # Minor: Night Owl (Am), Falling Out (D#m)
+        assert names == {"Night Owl", "Falling Out"}
+
+    def test_combined_filters_and_logic(self, full_db):
+        """All active predicates must pass — logical AND."""
+        tracks = self._all_tracks(full_db)
+        # Upbeat AND happy: BPM >= 100 AND valence >= 0.5
+        result = filter_by_features(tracks, full_db,
+                                    FeatureFilter(bpm_min=100, valence_min=0.5))
+        names = {t.track_name for t in result}
+        # BPM>=100: Morning(130), All(100), Falling(150). valence>=0.5:
+        # Morning(0.7), All(0.5). Intersection: Morning, All.
+        assert names == {"Morning Anthem", "All Context"}
+
+    def test_track_with_no_features_excluded_when_filter_active(self, full_db):
+        """Track 4 ('Rare Gem') has no row in acousticbrainz_features. Any
+        active filter must exclude it."""
+        tracks = self._all_tracks(full_db)
+        # bpm_min=0 matches every track that HAS a bpm value
+        result = filter_by_features(tracks, full_db, FeatureFilter(bpm_min=0))
+        names = {t.track_name for t in result}
+        assert "Rare Gem" not in names
+        # All other tracks should pass
+        assert names == {"Morning Anthem", "Night Owl", "All Context", "Falling Out"}
+
+    def test_no_matches_returns_empty(self, full_db):
+        tracks = self._all_tracks(full_db)
+        # No track has BPM >= 1000
+        assert filter_by_features(tracks, full_db, FeatureFilter(bpm_min=1000)) == []
+
+    def test_instrumental_min(self, full_db):
+        tracks = self._all_tracks(full_db)
+        # All Context has instrumental=0.5; rest are below 0.3
+        result = filter_by_features(tracks, full_db,
+                                    FeatureFilter(instrumental_min=0.4))
+        names = {t.track_name for t in result}
+        assert names == {"All Context"}
+
+
+# ---------------------------------------------------------------------------
+# load_features_for_tracks
+# ---------------------------------------------------------------------------
+class TestLoadFeatures:
+
+    def test_returns_dict_keyed_by_track_id(self, full_db):
+        out = load_features_for_tracks(full_db, [1, 2, 3])
+        assert set(out.keys()) == {1, 2, 3}
+        assert out[1]["bpm"] == 130.0
+        assert out[2]["valence"] == 0.30
+
+    def test_missing_track_simply_absent(self, full_db):
+        # Track 4 has no features — request it, should just not be in result
+        out = load_features_for_tracks(full_db, [1, 4])
+        assert 1 in out
+        assert 4 not in out
+
+    def test_empty_input_returns_empty_dict(self, full_db):
+        assert load_features_for_tracks(full_db, []) == {}
+
+
+# ---------------------------------------------------------------------------
+# build_playlist with features
+# ---------------------------------------------------------------------------
+class TestBuildPlaylistWithFeatures:
+
+    def test_feature_filter_applies_in_pipeline(self, full_db):
+        config = _make_playlist_config(top=10)
+        config.feature_filter = FeatureFilter(bpm_min=120)
+        result = build_playlist(full_db, config)
+        names = {t.track_name for t in result}
+        assert names == {"Morning Anthem", "Falling Out"}
+
+    def test_feature_combined_with_mode_and_love_min(self, full_db):
+        """All three filters AND together: mode + love + features."""
+        # Mode 'weekday morning' (ctx 1) primaries: Morning, Rare Gem, Falling Out
+        # Of those, BPM>=120: Morning (130) and Falling Out (150) — Rare Gem
+        # has no features so excluded by the feature filter.
+        # Then love_min filters further. Falling Out has low love score.
+        config = _make_playlist_config(
+            mode="weekday morning", love_min=1.0, top=10,
+        )
+        config.feature_filter = FeatureFilter(bpm_min=120)
+        result = build_playlist(full_db, config)
+        names = {t.track_name for t in result}
+        assert "Morning Anthem" in names
+        assert "Rare Gem" not in names  # excluded by feature filter (no features)
+        for t in result:
+            assert t.love_score >= 1.0
+
+
+# ---------------------------------------------------------------------------
+# Output formats with features
+# ---------------------------------------------------------------------------
+class TestOutputFormatsWithFeatures:
+
+    def test_table_with_features_includes_columns(self, full_db, capsys):
+        config = _make_playlist_config(top=5)
+        tracks = build_playlist(full_db, config)
+        features = load_features_for_tracks(full_db, [t.track_id for t in tracks])
+        print_table(tracks, mode=None, features_by_id=features)
+        captured = capsys.readouterr()
+        # Feature column headers
+        assert "BPM" in captured.out
+        assert "Vlnc" in captured.out
+        assert "Key" in captured.out
+
+    def test_table_without_features_unchanged(self, full_db, capsys):
+        """Backward compat: passing features_by_id=None gives the old layout."""
+        config = _make_playlist_config(top=5)
+        tracks = build_playlist(full_db, config)
+        print_table(tracks, mode=None, features_by_id=None)
+        captured = capsys.readouterr()
+        # Old columns
+        assert "Avg%" in captured.out
+        # Should NOT have feature columns
+        assert "Vlnc" not in captured.out
+
+    def test_json_with_features_includes_audio_features(self, full_db, capsys):
+        config = _make_playlist_config(top=3)
+        tracks = build_playlist(full_db, config)
+        features = load_features_for_tracks(full_db, [t.track_id for t in tracks])
+        print_json(tracks, mode=None, features_by_id=features)
+        captured = capsys.readouterr()
+        parsed = json.loads(captured.out)
+        # Every track entry should have an audio_features key
+        for entry in parsed["tracks"]:
+            assert "audio_features" in entry
+        # At least one track has populated features
+        assert any(e["audio_features"]["bpm"] is not None
+                   for e in parsed["tracks"])
+
+    def test_json_without_features_omits_audio_features_key(self, full_db, capsys):
+        config = _make_playlist_config(top=3)
+        tracks = build_playlist(full_db, config)
+        print_json(tracks, mode=None, features_by_id=None)
+        captured = capsys.readouterr()
+        parsed = json.loads(captured.out)
+        for entry in parsed["tracks"]:
+            assert "audio_features" not in entry
+
+    def test_track_without_features_renders_dash_in_table(self, full_db, capsys):
+        """Rare Gem has no AB row; table should show '-' placeholders, not crash."""
+        # Don't filter — include all tracks so Rare Gem is in the result
+        config = _make_playlist_config(top=10)
+        tracks = build_playlist(full_db, config)
+        features = load_features_for_tracks(full_db, [t.track_id for t in tracks])
+        print_table(tracks, mode=None, features_by_id=features)
+        captured = capsys.readouterr()
+        # Rare Gem should appear with dash placeholders for features
+        rare_lines = [line for line in captured.out.split("\n") if "Rare Gem" in line]
+        assert rare_lines  # the line exists
+        # Should contain dash placeholders (not crash with formatting errors)
+        assert "-" in rare_lines[0]
 
 
 if __name__ == "__main__":
