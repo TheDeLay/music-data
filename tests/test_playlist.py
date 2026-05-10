@@ -22,15 +22,20 @@ import pytest
 from scripts.playlist import (
     EMPTY_MSG,
     FeatureFilter,
+    MetadataFilter,
     ModeNotFoundError,
     PlaylistConfig,
     build_playlist,
     filter_by_context,
     filter_by_features,
+    filter_by_release_year,
+    filter_by_tags,
     load_features_for_tracks,
     print_json,
     print_table,
+    print_text,
     print_uris,
+    print_urls,
     resolve_context,
 )
 from scripts.score import ScoreConfig, TrackScore, score_tracks
@@ -662,6 +667,358 @@ class TestOutputFormatsWithFeatures:
         assert rare_lines  # the line exists
         # Should contain dash placeholders (not crash with formatting errors)
         assert "-" in rare_lines[0]
+
+
+# ---------------------------------------------------------------------------
+# Metadata filters: release year + tags (Batch 1 of genre-enrichment-sprint)
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def meta_db(tmp_path):
+    """DB with multi-year albums + multiple artists + tag rows on each surface.
+
+    Tracks span three decades so release-year filters have something to discriminate.
+    Tag data is seeded across all three surfaces (track_labels, artist_labels,
+    artist_classifications) so tag-source coverage tests have real targets.
+
+    Track layout:
+      1  90s metal track    artist=Megafake (artist_labels: 'tag'='thrash metal')
+      2  90s pop track      artist=Popstar  (no tags anywhere)
+      3  2010s metal track  artist=Megafake
+      4  2020 unknown-year  artist=Untagged (release_year IS NULL)
+      5  90s rock track     artist=Rocker   (track_labels: 'genre'='rock'; manual cls.: 'classic-rock')
+    """
+    conn = _new_db(tmp_path)
+    conn.execute("INSERT INTO ingestion_runs (run_id, source, status) "
+                 "VALUES (1, 'test', 'completed')")
+
+    artists = [
+        (1, "Megafake", "megafake"),
+        (2, "Popstar", "popstar"),
+        (3, "Untagged", "untagged"),
+        (4, "Rocker", "rocker"),
+    ]
+    for aid, name, norm in artists:
+        conn.execute("INSERT INTO artists (artist_id, name, name_normalized) "
+                     "VALUES (?, ?, ?)", (aid, name, norm))
+
+    albums = [
+        (1, "Metal Vol 1",      "metal vol 1",     1995),
+        (2, "Pop Hits",         "pop hits",        1998),
+        (3, "Metal Comeback",   "metal comeback",  2015),
+        (4, "Mystery Album",    "mystery album",   None),    # NULL release_year
+        (5, "Rock Anthems",     "rock anthems",    1992),
+    ]
+    for alid, name, norm, year in albums:
+        conn.execute(
+            "INSERT INTO albums (album_id, name, name_normalized, release_year) "
+            "VALUES (?, ?, ?, ?)", (alid, name, norm, year))
+
+    tracks = [
+        (1, "spotify:track:m1", "Heavy Riff",      1, 1),
+        (2, "spotify:track:p1", "Pop Tune",        2, 2),
+        (3, "spotify:track:m2", "Modern Metal",    1, 3),
+        (4, "spotify:track:u1", "Unknown Year",    3, 4),
+        (5, "spotify:track:r1", "Classic Rocker",  4, 5),
+    ]
+    for tid, uri, name, aid, alid in tracks:
+        conn.execute(
+            "INSERT INTO tracks (track_id, spotify_track_uri, name, album_id, duration_ms) "
+            "VALUES (?, ?, ?, ?, 240000)", (tid, uri, name, alid))
+        conn.execute("INSERT INTO track_artists (track_id, artist_id, position) "
+                     "VALUES (?, ?, 0)", (tid, aid))
+
+    # Each track gets one play so it surfaces in score_tracks.
+    # content_uri matches the track's URI so the UNIQUE(ts, content_uri,
+    # ms_played) constraint is satisfied without per-row jitter.
+    for tid, uri, *_ in tracks:
+        conn.execute(
+            "INSERT INTO plays (ts, ms_played, content_type, content_uri, "
+            "track_id, source, ingestion_run_id) "
+            "VALUES (datetime('now', '-10 days'), 230000, 'track', ?, ?, 'test', 1)",
+            (uri, tid),
+        )
+
+    # Tag surface 1: artist_labels (the LF target table)
+    conn.execute(
+        "INSERT INTO artist_labels (artist_id, label_key, label_value, set_by) "
+        "VALUES (1, 'tag', 'thrash metal', 'lastfm')"
+    )
+    # Tag surface 2: track_labels (the MB target table)
+    conn.execute(
+        "INSERT INTO track_labels (track_id, label_key, label_value, set_by) "
+        "VALUES (5, 'genre', 'rock', 'mb')"
+    )
+    # Tag surface 3: artist_classifications (the manual-YAML target table)
+    conn.execute(
+        "INSERT INTO artist_classifications (artist_id, classification, method, confidence) "
+        "VALUES (4, 'classic-rock', 'label_match', 1.0)"
+    )
+
+    conn.commit()
+    yield conn
+    conn.close()
+
+
+class TestMetadataFilter:
+
+    def test_default_is_inactive(self):
+        assert MetadataFilter().is_active() is False
+
+    def test_release_year_min_active(self):
+        assert MetadataFilter(release_year_min=1990).is_active() is True
+
+    def test_tags_list_active(self):
+        assert MetadataFilter(tags=["metal"]).is_active() is True
+
+    def test_empty_tags_list_inactive(self):
+        assert MetadataFilter(tags=[]).is_active() is False
+
+
+class TestFilterByReleaseYear:
+
+    def _ts(self, ids):
+        return [TrackScore(
+            track_id=tid, spotify_track_uri=f"spotify:track:t{tid}",
+            track_name=f"T{tid}", primary_artist_name="A", album_name="X",
+            release_year=2000, duration_ms=240000,
+            total_plays=1, quality_plays=1, recent_quality=1,
+            backbutton_count=0, recent_plays=1, skip_count=0,
+            avg_pct_played=1.0,
+        ) for tid in ids]
+
+    def test_no_filter_returns_input(self, meta_db):
+        tracks = self._ts([1, 2, 3, 4, 5])
+        out = filter_by_release_year(tracks, meta_db, None, None)
+        assert [t.track_id for t in out] == [1, 2, 3, 4, 5]
+
+    def test_year_min_only(self, meta_db):
+        tracks = self._ts([1, 2, 3, 4, 5])
+        out = filter_by_release_year(tracks, meta_db, 2000, None)
+        # Only track 3 (2015). Track 4 has NULL year — excluded.
+        assert [t.track_id for t in out] == [3]
+
+    def test_year_max_only(self, meta_db):
+        tracks = self._ts([1, 2, 3, 4, 5])
+        out = filter_by_release_year(tracks, meta_db, None, 1999)
+        # Tracks 1, 2, 5 are pre-2000.
+        assert sorted(t.track_id for t in out) == [1, 2, 5]
+
+    def test_year_range(self, meta_db):
+        tracks = self._ts([1, 2, 3, 4, 5])
+        out = filter_by_release_year(tracks, meta_db, 1990, 1999)
+        assert sorted(t.track_id for t in out) == [1, 2, 5]
+
+    def test_null_release_year_excluded(self, meta_db):
+        tracks = self._ts([4])
+        out = filter_by_release_year(tracks, meta_db, 1900, 2100)
+        assert out == []   # track 4's album has NULL release_year
+
+
+class TestFilterByTags:
+
+    def _ts(self, ids):
+        return [TrackScore(
+            track_id=tid, spotify_track_uri=f"spotify:track:t{tid}",
+            track_name=f"T{tid}", primary_artist_name="A", album_name="X",
+            release_year=2000, duration_ms=240000,
+            total_plays=1, quality_plays=1, recent_quality=1,
+            backbutton_count=0, recent_plays=1, skip_count=0,
+            avg_pct_played=1.0,
+        ) for tid in ids]
+
+    def test_empty_tags_returns_input(self, meta_db):
+        tracks = self._ts([1, 2, 3, 4, 5])
+        out = filter_by_tags(tracks, meta_db, [], "or")
+        assert [t.track_id for t in out] == [1, 2, 3, 4, 5]
+
+    def test_match_via_artist_labels(self, meta_db):
+        # Track 1 + 3 share artist 1 (Megafake), tagged 'thrash metal' on artist.
+        tracks = self._ts([1, 2, 3, 4, 5])
+        out = filter_by_tags(tracks, meta_db, ["metal"], "or")
+        assert sorted(t.track_id for t in out) == [1, 3]
+
+    def test_match_via_track_labels(self, meta_db):
+        # 'rock' substring matches:
+        #   - track 5 directly (track_labels: genre='rock')
+        #   - track 5 via Rocker's classification 'classic-rock' (contains 'rock')
+        # Track 4 (artist 3 Untagged) has no classification.
+        tracks = self._ts([1, 2, 3, 4, 5])
+        out = filter_by_tags(tracks, meta_db, ["rock"], "or")
+        assert [t.track_id for t in out] == [5]
+
+    def test_match_via_artist_classifications(self, meta_db):
+        # Artist 4 (Rocker) is classified 'classic-rock' and is the primary
+        # artist on track 5. Track 4's artist (Untagged) has no classification.
+        tracks = self._ts([1, 2, 3, 4, 5])
+        out = filter_by_tags(tracks, meta_db, ["classic-rock"], "or")
+        assert [t.track_id for t in out] == [5]
+
+    def test_or_semantics(self, meta_db):
+        tracks = self._ts([1, 2, 3, 4, 5])
+        # 'metal' matches [1, 3]; 'rock' matches [5]; OR = union.
+        out = filter_by_tags(tracks, meta_db, ["metal", "rock"], "or")
+        assert sorted(t.track_id for t in out) == [1, 3, 5]
+
+    def test_and_semantics(self, meta_db):
+        tracks = self._ts([1, 2, 3, 4, 5])
+        # 'metal' matches [1, 3]; 'rock' matches [5]; AND = intersection = empty.
+        out = filter_by_tags(tracks, meta_db, ["metal", "rock"], "and")
+        assert out == []
+
+    def test_case_insensitive(self, meta_db):
+        tracks = self._ts([1, 3])
+        out = filter_by_tags(tracks, meta_db, ["METAL"], "or")
+        assert sorted(t.track_id for t in out) == [1, 3]
+
+    def test_no_match_returns_empty(self, meta_db):
+        tracks = self._ts([1, 2, 3, 4, 5])
+        out = filter_by_tags(tracks, meta_db, ["polka"], "or")
+        assert out == []
+
+
+class TestVTrackTagsView:
+    """Integration tests for the v7 unified view that filter_by_tags queries."""
+
+    def test_surfaces_mb_track_label_tags(self, meta_db):
+        # meta_db seeded track 5 with track_labels(label_key='genre',
+        # label_value='rock', set_by='mb'). The view should expose it.
+        rows = meta_db.execute(
+            "SELECT track_id, tag, source FROM v_track_tags WHERE track_id = 5"
+        ).fetchall()
+        sources = {(r["tag"], r["source"]) for r in rows}
+        assert ("rock", "mb") in sources
+
+    def test_propagates_lastfm_artist_tags_through_track_artists(self, meta_db):
+        # meta_db seeded artist 1 (Megafake, primary on tracks 1+3) with
+        # artist_labels(label_key='tag', label_value='thrash metal',
+        # set_by='lastfm'). View propagates to ALL their primary tracks.
+        rows = meta_db.execute(
+            "SELECT DISTINCT track_id FROM v_track_tags "
+            "WHERE source = 'lastfm' AND tag = 'thrash metal'"
+        ).fetchall()
+        assert sorted(r["track_id"] for r in rows) == [1, 3]
+
+    def test_surfaces_classify_artists_classifications(self, meta_db):
+        # meta_db seeded artist 4 (Rocker, primary on track 5) with
+        # artist_classifications.classification = 'classic-rock'. View
+        # exposes via the classify_artists branch with manual precedence.
+        rows = meta_db.execute(
+            "SELECT track_id, tag, source, precedence FROM v_track_tags "
+            "WHERE source = 'classify_artists'"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["track_id"] == 5
+        assert rows[0]["tag"] == "classic-rock"
+        assert rows[0]["precedence"] == "manual"
+
+    def test_excludes_sentinel_rows(self, meta_db):
+        # Even if MB / LF sentinel rows leak into the labels tables, the view
+        # filters to label_key in ('tag', 'genre') so sentinels never surface.
+        meta_db.execute(
+            "INSERT INTO track_labels (track_id, label_key, label_value, set_by) "
+            "VALUES (1, 'mb-tags-fetched', 'true', 'mb')"
+        )
+        meta_db.execute(
+            "INSERT INTO artist_labels (artist_id, label_key, label_value, set_by) "
+            "VALUES (1, 'lastfm-fetched', 'true', 'lastfm')"
+        )
+        meta_db.commit()
+        sentinel_rows = meta_db.execute(
+            "SELECT * FROM v_track_tags WHERE tag IN ('true', 'mb-tags-fetched', 'lastfm-fetched')"
+        ).fetchall()
+        assert sentinel_rows == []
+
+
+class TestBuildPlaylistWithMetadata:
+
+    def test_release_year_combined_with_tag(self, meta_db):
+        # 90s metal: release-year 1990-1999 AND tag 'metal'.
+        # Track 1 (Heavy Riff, 1995, Megafake) qualifies.
+        # Track 3 (Modern Metal, 2015) tagged metal but wrong era.
+        config = PlaylistConfig(
+            score_config=ScoreConfig(),
+            metadata_filter=MetadataFilter(
+                release_year_min=1990, release_year_max=1999, tags=["metal"],
+            ),
+        )
+        out = build_playlist(meta_db, config)
+        assert [t.track_id for t in out] == [1]
+
+
+class TestPrintText:
+    """The 'Artist - Title' format that bulk-import tools (TuneMyMusic etc.)
+    actually parse — verified end-to-end against TuneMyMusic 2026-05-09."""
+
+    def _ts(self, items):
+        from scripts.score import TrackScore
+        return [TrackScore(
+            track_id=tid, spotify_track_uri=f"spotify:track:t{tid}",
+            track_name=name, primary_artist_name=artist, album_name="X",
+            release_year=2000, duration_ms=240000,
+            total_plays=1, quality_plays=1, recent_quality=1,
+            backbutton_count=0, recent_plays=1, skip_count=0,
+            avg_pct_played=1.0,
+        ) for tid, name, artist in items]
+
+    def test_artist_dash_title_one_per_line(self, capsys):
+        tracks = self._ts([
+            (1, "Bohemian Rhapsody", "Queen"),
+            (2, "Smells Like Teen Spirit", "Nirvana"),
+        ])
+        print_text(tracks, None)
+        out = capsys.readouterr().out.splitlines()
+        assert out == [
+            "Queen - Bohemian Rhapsody",
+            "Nirvana - Smells Like Teen Spirit",
+        ]
+
+    def test_empty_tracks_prints_to_stderr(self, capsys):
+        """Empty result message on stderr so '--format text > file' produces
+        an empty file rather than one with the EMPTY_MSG inside."""
+        print_text([], None)
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert EMPTY_MSG in captured.err
+
+    def test_missing_artist_falls_back_to_unknown(self, capsys):
+        tracks = self._ts([(1, "Mystery Track", None)])
+        print_text(tracks, None)
+        assert "Unknown Artist" in capsys.readouterr().out
+
+    def test_missing_title_falls_back_to_unknown(self, capsys):
+        tracks = self._ts([(1, None, "Some Artist")])
+        print_text(tracks, None)
+        assert "Unknown Title" in capsys.readouterr().out
+
+
+class TestPrintUrls:
+
+    def _ts(self, items):
+        from scripts.score import TrackScore
+        return [TrackScore(
+            track_id=tid, spotify_track_uri=uri,
+            track_name="x", primary_artist_name="x", album_name="x",
+            release_year=2000, duration_ms=240000,
+            total_plays=1, quality_plays=1, recent_quality=1,
+            backbutton_count=0, recent_plays=1, skip_count=0,
+            avg_pct_played=1.0,
+        ) for tid, uri in items]
+
+    def test_uri_to_url_conversion(self, capsys):
+        tracks = self._ts([(1, "spotify:track:abc123"), (2, "spotify:track:def456")])
+        print_urls(tracks, None)
+        out = capsys.readouterr().out.splitlines()
+        assert out == [
+            "https://open.spotify.com/track/abc123",
+            "https://open.spotify.com/track/def456",
+        ]
+
+    def test_skips_tracks_with_no_uri(self, capsys):
+        tracks = self._ts([(1, ""), (2, "spotify:track:abc123")])
+        print_urls(tracks, None)
+        # Empty URI → no URL printed for that track
+        out = capsys.readouterr().out.splitlines()
+        assert out == ["https://open.spotify.com/track/abc123"]
 
 
 if __name__ == "__main__":

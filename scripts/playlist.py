@@ -41,6 +41,12 @@ from typing import Optional
 
 from scripts.db import connect
 from scripts.score import ScoreConfig, TrackScore, score_tracks
+# NOTE: SpotifyClient was imported here for the (now-removed) --push-to-spotify
+# feature. It's no longer used directly by playlist.py — leaving the import out
+# keeps the module dependency-light. The client + its create_playlist /
+# add_tracks_to_playlist methods remain in scripts/spotify_client.py for
+# completeness (they're correct code, blocked only by Spotify's March 2026
+# dev-mode policy — see memory/reference_spotify_write_endpoints_2026.md).
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +76,29 @@ class FeatureFilter:
 
 
 @dataclass
+class MetadataFilter:
+    """Non-feature metadata filters (release year, tags).
+
+    These hit different tables than FeatureFilter (albums, track_labels,
+    artist_labels) so they're a separate dataclass — keeps the SQL-builder
+    in filter_by_features focused on acousticbrainz_features.
+
+    All fields default to no-op. tags=[] means no tag filter active.
+    """
+    release_year_min: Optional[int] = None
+    release_year_max: Optional[int] = None
+    tags: list[str] = field(default_factory=list)
+    tag_mode: str = "or"   # "or" = match any tag; "and" = match all tags
+
+    def is_active(self) -> bool:
+        return (
+            self.release_year_min is not None
+            or self.release_year_max is not None
+            or len(self.tags) > 0
+        )
+
+
+@dataclass
 class PlaylistConfig:
     score_config: ScoreConfig
     mode: Optional[str] = None             # raw user input — label or cluster_id
@@ -77,6 +106,7 @@ class PlaylistConfig:
     top: int = 30
     min_affinity: Optional[float] = None   # None = strict (is_primary=1 only)
     feature_filter: FeatureFilter = field(default_factory=FeatureFilter)
+    metadata_filter: MetadataFilter = field(default_factory=MetadataFilter)
 
 
 class ModeNotFoundError(Exception):
@@ -217,6 +247,83 @@ def filter_by_features(
     return [t for t in tracks if t.track_id in eligible]
 
 
+def filter_by_release_year(
+    tracks: list[TrackScore],
+    conn: sqlite3.Connection,
+    year_min: Optional[int],
+    year_max: Optional[int],
+) -> list[TrackScore]:
+    """Keep tracks whose album.release_year falls in [year_min, year_max].
+
+    Tracks whose album has no release_year are excluded (NULL fails any
+    active filter — same convention as filter_by_features).
+    """
+    if year_min is None and year_max is None:
+        return tracks
+    clauses, params = [], []
+    if year_min is not None:
+        clauses.append("al.release_year >= ?"); params.append(year_min)
+    if year_max is not None:
+        clauses.append("al.release_year <= ?"); params.append(year_max)
+    where = " AND ".join(clauses)
+    rows = conn.execute(
+        f"SELECT t.track_id FROM tracks t "
+        f"JOIN albums al ON al.album_id = t.album_id "
+        f"WHERE {where}",
+        tuple(params),
+    ).fetchall()
+    eligible = {r["track_id"] for r in rows}
+    return [t for t in tracks if t.track_id in eligible]
+
+
+def filter_by_tags(
+    tracks: list[TrackScore],
+    conn: sqlite3.Connection,
+    tags: list[str],
+    mode: str = "or",
+) -> list[TrackScore]:
+    """Keep tracks whose tags match the requested set.
+
+    Queries the unified `v_track_tags` view (schema v7+), which UNIONs:
+      - MusicBrainz track-level tags + genres (set_by='mb')
+      - Last.fm artist-level tags propagated through track_artists (set_by='lastfm')
+      - Manual track-level overrides (set_by IS NULL on track_labels)
+      - Manual YAML artist classifications (from classify_artists.py)
+
+    Match is case-insensitive substring (so --tag metal hits 'thrash metal',
+    'heavy metal', 'nu metal'). Use --tag-mode and to require ALL tags.
+
+    Empty `tags` list returns input unchanged.
+    """
+    if not tags:
+        return tracks
+    if not tracks:
+        return []
+
+    track_ids = [t.track_id for t in tracks]
+    placeholders = ",".join("?" * len(track_ids))
+
+    matched_per_tag: list[set[int]] = []
+    for tag in tags:
+        like = f"%{tag.lower()}%"
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT track_id FROM v_track_tags
+            WHERE track_id IN ({placeholders})
+              AND LOWER(tag) LIKE ?
+            """,
+            track_ids + [like],
+        ).fetchall()
+        matched_per_tag.append({r["track_id"] for r in rows})
+
+    if mode == "and":
+        eligible = set.intersection(*matched_per_tag) if matched_per_tag else set()
+    else:
+        eligible = set.union(*matched_per_tag) if matched_per_tag else set()
+
+    return [t for t in tracks if t.track_id in eligible]
+
+
 def load_features_for_tracks(
     conn: sqlite3.Connection, track_ids: list[int],
 ) -> dict[int, sqlite3.Row]:
@@ -251,6 +358,18 @@ def build_playlist(
         tracks = [t for t in tracks if t.love_score >= config.love_min]
 
     tracks = filter_by_features(tracks, conn, config.feature_filter)
+
+    if config.metadata_filter.is_active():
+        tracks = filter_by_release_year(
+            tracks, conn,
+            config.metadata_filter.release_year_min,
+            config.metadata_filter.release_year_max,
+        )
+        tracks = filter_by_tags(
+            tracks, conn,
+            config.metadata_filter.tags,
+            config.metadata_filter.tag_mode,
+        )
 
     return tracks[:config.top]
 
@@ -364,6 +483,48 @@ def print_uris(tracks: list[TrackScore], mode: Optional[str]) -> None:
         print(t.spotify_track_uri)
 
 
+def print_text(tracks: list[TrackScore], mode: Optional[str]) -> None:
+    """One 'Artist - Title' line per track. The format third-party importers
+    accept (TuneMyMusic verified 2026-05-09; Soundiiz etc. expected to use
+    the same format). Plain ASCII fallback when artist/title contain weird
+    chars is intentionally not normalized — Spotify's matcher is lenient.
+
+    Use this format when piping to a bulk-import tool. URL/URI formats look
+    cleaner but the importers do text-search on whatever you paste, so
+    'open.spotify.com' becomes a search for 'open' and you get garbage.
+    """
+    if not tracks:
+        print(EMPTY_MSG, file=sys.stderr)
+        return
+    for t in tracks:
+        artist = (t.primary_artist_name or "").strip() or "Unknown Artist"
+        title = (t.track_name or "").strip() or "Unknown Title"
+        print(f"{artist} - {title}")
+
+
+def print_urls(tracks: list[TrackScore], mode: Optional[str]) -> None:
+    """One https://open.spotify.com/track/... URL per line.
+
+    Browser-friendly format (a URL is clickable in any terminal that
+    supports OSC 8 hyperlinks; otherwise still works as plain text). Also
+    the format third-party migration tools (Soundiiz, SongShift, etc.)
+    accept on import. Spotify's own desktop app does NOT reliably accept
+    pasted URLs as track-add — verified empirically 2026-05-09 — so the
+    expected workflow is "pipe to migration tool" or "click each one to
+    add manually," not "paste into a Spotify playlist."
+
+    Same stderr-on-empty convention as print_uris.
+    """
+    if not tracks:
+        print(EMPTY_MSG, file=sys.stderr)
+        return
+    for t in tracks:
+        # spotify:track:ID → https://open.spotify.com/track/ID
+        track_id = (t.spotify_track_uri or "").split(":")[-1]
+        if track_id:
+            print(f"https://open.spotify.com/track/{track_id}")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -384,8 +545,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="Loose mode: include tracks with affinity >= this "
                              "(0.0-1.0). Without this flag, strict mode "
                              "(is_primary=1 only) is used.")
-    parser.add_argument("--format", choices=["table", "json", "uris"], default="table",
-                        help="Output format. uris = paste-into-Spotify lines.")
+    parser.add_argument("--format", choices=["table", "json", "uris", "urls", "text"], default="table",
+                        help="Output format. text = 'Artist - Title' lines, the format "
+                             "third-party importers (TuneMyMusic, Soundiiz) actually parse "
+                             "into Spotify playlists (verified 2026-05-09). urls = "
+                             "https://open.spotify.com/track/... lines (clickable but NOT "
+                             "accepted by importers — they treat it as search text). uris = "
+                             "spotify:track:... lines (API/SDK form, same caveat as urls).")
     parser.add_argument("--db", type=str, default=None,
                         help="Path to music.db (default: auto-detect)")
 
@@ -419,6 +585,31 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--show-features", action="store_true",
                         help="Show audio-feature columns in the table format. "
                              "Auto-on when any feature filter is active.")
+
+    # Metadata filters (release year, tags) — separate from audio features
+    # because they hit different tables (albums, track_labels, artist_labels,
+    # artist_classifications).
+    parser.add_argument("--release-year-min", type=int, default=None,
+                        help="Minimum album release year (inclusive). "
+                             "Tracks on albums without a release_year are excluded.")
+    parser.add_argument("--release-year-max", type=int, default=None,
+                        help="Maximum album release year (inclusive).")
+    parser.add_argument("--tag", action="append", default=[],
+                        help="Filter to tracks tagged with this string. "
+                             "Repeat for multiple tags. Match is case-insensitive "
+                             "substring across track tags, artist tags, and "
+                             "manual classifications. Default OR semantics; "
+                             "use --tag-mode and for AND.")
+    parser.add_argument("--tag-mode", choices=["or", "and"], default="or",
+                        help="Combine multiple --tag flags with OR (default) or AND.")
+
+    # NOTE: --push-to-spotify was removed 2026-05-09 after empirical testing
+    # showed Spotify's March 2026 dev-mode restrictions block POST /playlists/
+    # {id}/tracks. We can create empty playlists but not populate them via API,
+    # and Spotify desktop's paste-text-to-playlist isn't a real workflow either
+    # (treats text as search, adds wrong recommendations). Use --format urls
+    # and a third-party migration tool, or add tracks manually in Spotify.
+    # See memory: reference_spotify_write_endpoints_2026.md.
 
     parser.add_argument("--quality-threshold", type=float, default=0.80,
                         help="Min pct_played to count as a quality play (0.0-1.0)")
@@ -454,6 +645,12 @@ def main(argv: list[str] | None = None) -> int:
         key=args.key,
         key_mode={"minor": 0, "major": 1}.get(args.key_mode),
     )
+    metadata_filter = MetadataFilter(
+        release_year_min=args.release_year_min,
+        release_year_max=args.release_year_max,
+        tags=list(args.tag),
+        tag_mode=args.tag_mode,
+    )
     config = PlaylistConfig(
         score_config=score_config,
         mode=args.mode,
@@ -461,6 +658,7 @@ def main(argv: list[str] | None = None) -> int:
         top=args.top,
         min_affinity=args.min_affinity,
         feature_filter=feature_filter,
+        metadata_filter=metadata_filter,
     )
 
     conn = connect(args.db)
@@ -487,6 +685,10 @@ def main(argv: list[str] | None = None) -> int:
             print_json(tracks, args.mode, features_by_id)
         elif args.format == "uris":
             print_uris(tracks, args.mode)
+        elif args.format == "urls":
+            print_urls(tracks, args.mode)
+        elif args.format == "text":
+            print_text(tracks, args.mode)
         else:
             print_table(tracks, args.mode,
                         features_by_id if show_features else None)
