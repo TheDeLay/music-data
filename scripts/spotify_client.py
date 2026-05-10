@@ -42,12 +42,16 @@ API_BASE = "https://api.spotify.com/v1"
 # - user-read-recently-played: /me/player/recently-played
 # - user-read-private: basic profile (helpful for sanity checks)
 # - playlist-modify-private + playlist-modify-public: future playlist creation
+# - user-library-read + user-library-modify: Liked-Songs feedback loop
+#   (feed engagement-DB top picks into Spotify's own recommender)
 DEFAULT_SCOPES = (
     "user-read-recently-played "
     "user-read-private "
     "user-top-read "
     "playlist-modify-private "
-    "playlist-modify-public"
+    "playlist-modify-public "
+    "user-library-read "
+    "user-library-modify"
 )
 
 
@@ -268,12 +272,92 @@ class SpotifyClient:
         if not captured.get("code") or captured.get("state") != state:
             raise SpotifyAuthError("authorization callback did not return a valid code")
 
-        # Exchange code for tokens
+        self._exchange_code_for_token(captured["code"], verifier)
+
+    # -------------------------------------------------------------------------
+    # OAuth Authorization Code with PKCE — headless variant
+    # -------------------------------------------------------------------------
+    def authorize_headless(self, input_fn=input, print_fn=print) -> None:
+        """OAuth flow for hosts without a browser (or where the listener can't bind).
+
+        Prints the auth URL, waits for the user to paste back the redirect URL
+        from their browser's address bar, extracts the code+state, exchanges
+        for tokens. The redirect target won't actually load (it tries to hit a
+        local 8888 port that isn't listening on the user's machine) — that's
+        fine, the URL bar contains everything we need.
+
+        input_fn / print_fn are injected for testability; production calls use
+        Python's built-in input() and print().
+        """
+        verifier = secrets.token_urlsafe(64)
+        challenge = base64.urlsafe_b64encode(
+            hashlib.sha256(verifier.encode()).digest()
+        ).decode().rstrip("=")
+        state = secrets.token_urlsafe(16)
+
+        params = {
+            "response_type": "code",
+            "client_id": self.client_id,
+            "redirect_uri": self.redirect_uri,
+            "scope": self.scopes,
+            "state": state,
+            "code_challenge_method": "S256",
+            "code_challenge": challenge,
+        }
+        url = f"{AUTH_URL}?{urllib.parse.urlencode(params)}"
+
+        print_fn("")
+        print_fn("=" * 70)
+        print_fn("Spotify OAuth (headless paste-back flow)")
+        print_fn("=" * 70)
+        print_fn("")
+        print_fn("1. Open this URL in any browser (laptop, phone, anywhere):")
+        print_fn("")
+        print_fn(f"   {url}")
+        print_fn("")
+        print_fn("2. Authorize the app.")
+        print_fn(f"3. Spotify will redirect to {self.redirect_uri} which won't load")
+        print_fn("   (no listener on 8888 from your machine — that's expected).")
+        print_fn("4. COPY the FULL URL from your browser's address bar.")
+        print_fn("   (Looks like '...?code=...&state=...')")
+        print_fn("")
+        pasted = input_fn("5. Paste the full URL here, then press Enter: ").strip()
+
+        # Accept either a full URL or just the code+state params after a '?'.
+        if "?" in pasted:
+            qs = pasted.split("?", 1)[1]
+        else:
+            qs = pasted
+        parsed_params = urllib.parse.parse_qs(qs)
+        code = (parsed_params.get("code") or [None])[0]
+        returned_state = (parsed_params.get("state") or [None])[0]
+
+        if not code:
+            raise SpotifyAuthError(
+                "no 'code' parameter found in pasted URL — paste the full "
+                "URL including the query string"
+            )
+        if returned_state != state:
+            raise SpotifyAuthError(
+                f"state mismatch (CSRF guard): expected {state!r}, got "
+                f"{returned_state!r}. Re-run auth — do not reuse a previous URL."
+            )
+
+        self._exchange_code_for_token(code, verifier)
+        print_fn("")
+        print_fn(f"OK Token saved to {TOKEN_PATH}")
+
+    def _exchange_code_for_token(self, code: str, verifier: str) -> None:
+        """Exchange an authorization code (PKCE) for an access token.
+
+        Shared by both the browser-based _authorize() and the headless
+        authorize_headless() flows so the two paths can't drift apart.
+        """
         resp = requests.post(
             TOKEN_URL,
             data={
                 "grant_type": "authorization_code",
-                "code": captured["code"],
+                "code": code,
                 "redirect_uri": self.redirect_uri,
                 "client_id": self.client_id,
                 "code_verifier": verifier,
@@ -451,6 +535,139 @@ class SpotifyClient:
         data = self.get("/search", params={"q": name, "type": "artist", "limit": 1})
         items = (data.get("artists") or {}).get("items") or []
         return items[0] if items else None
+
+    # -------------------------------------------------------------------------
+    # Write endpoints (require auth="user" + playlist-modify-* scope)
+    # -------------------------------------------------------------------------
+    def post(self, path: str, json_body: dict | None = None) -> dict | None:
+        """POST to the Spotify API with throttle/auth/retry, mirroring get().
+
+        Returns the parsed JSON body (Spotify's POST endpoints typically
+        return the created/modified resource). Returns {} for 204 No Content.
+        Raises on persistent failure same as get().
+        """
+        url = path if path.startswith("http") else f"{API_BASE}{path}"
+        for attempt in range(5):
+            self._throttle()
+            tok = self._ensure_token()
+            resp = self._session.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {tok}",
+                    "Content-Type": "application/json",
+                },
+                json=json_body,
+                timeout=30,
+            )
+            self._last_request_at = time.time()
+            self.stats["calls_total"] += 1
+            if 200 <= resp.status_code < 300:
+                self._last_progress_at = self._last_request_at
+                self.stats["calls_200"] += 1
+                if resp.status_code == 204 or not resp.content:
+                    return {}
+                return resp.json()
+            if resp.status_code == 401:
+                log.info("401 on POST %s — refreshing token and retrying", path)
+                if self.auth_mode == "app":
+                    self._app_token = None
+                else:
+                    self._token = None
+                continue
+            if resp.status_code == 429:
+                self.stats["calls_429"] += 1
+                retry_after = int(resp.headers.get("Retry-After", "10"))
+                if retry_after > self.long_penalty_threshold_seconds:
+                    log.error("429 on POST %s with Retry-After=%ds — aborting",
+                              path, retry_after)
+                    raise LongPenaltyError(
+                        f"Spotify returned 429 with Retry-After={retry_after}s on POST"
+                    )
+                wait = min(retry_after, 300)
+                log.warning("429 on POST %s  Retry-After=%ds  attempt=%d/5",
+                            path, retry_after, attempt + 1)
+                self._backoff_until = max(self._backoff_until, time.time() + wait)
+                time.sleep(wait)
+                continue
+            if 500 <= resp.status_code < 600:
+                self.stats["calls_5xx"] += 1
+                backoff = 2 ** attempt
+                log.warning("%d on POST %s  attempt=%d/5  (sleeping %ds)",
+                            resp.status_code, path, attempt + 1, backoff)
+                time.sleep(backoff)
+                continue
+            # 4xx other — surface to caller without retry
+            resp.raise_for_status()
+        raise RuntimeError(f"giving up on POST {url} after retries")
+
+    def create_playlist(
+        self,
+        name: str,
+        description: str = "",
+        public: bool = False,
+        collaborative: bool = False,
+    ) -> dict:
+        """Create an empty playlist in the authenticated user's account.
+
+        Uses POST /me/playlists. The legacy POST /users/{user_id}/playlists
+        endpoint returns 403 for dev apps created after Nov 2024
+        (verified empirically 2026-05-09 — Spotify deprecated it without
+        prominent docs warning). /me/playlists is the modern equivalent
+        and works with the same scopes.
+
+        Defaults to private + non-collaborative — safest for an automated
+        tool. Returns the created playlist resource with 'id' and
+        'external_urls.spotify' (the user-facing URL).
+
+        NOTE: Adding tracks to the new playlist requires
+        add_tracks_to_playlist(), which is currently 403'd by Spotify for
+        new dev apps (March 2026 migration). See that method's docstring.
+        """
+        if not name:
+            raise ValueError("playlist name is required and must be non-empty")
+        return self.post(
+            "/me/playlists",
+            json_body={
+                "name": name,
+                "description": description,
+                "public": public,
+                "collaborative": collaborative,
+            },
+        )
+
+    def add_tracks_to_playlist(
+        self,
+        playlist_id: str,
+        track_uris: list[str],
+    ) -> int:
+        """Add tracks to a playlist. Returns total count added.
+
+        Spotify caps each request at 100 URIs; this method chunks larger
+        lists transparently.
+
+        IMPORTANT (verified 2026-05-09): Spotify's March 2026 Web API
+        migration removed POST /playlists/{id}/tracks (and PUT) for dev
+        apps created after Nov 2024. Both methods now return 403 with a
+        bare 'Forbidden' message. There is no documented workaround at
+        the API level for individual developers in Development Mode.
+        Apps approved BEFORE Nov 27 2024 retain access (grandfathered).
+
+        This method is preserved as the correct implementation — if
+        Spotify ever lifts the restriction or your app gets granted
+        legacy access, it works as-is. Until then, callers should catch
+        the resulting HTTPError and degrade gracefully (e.g., print URIs
+        for the user to paste into the empty playlist via Spotify desktop).
+        """
+        if not playlist_id:
+            raise ValueError("playlist_id is required")
+        added = 0
+        for chunk in _chunks(list(track_uris), 100):
+            self.post(
+                f"/playlists/{playlist_id}/tracks",
+                json_body={"uris": chunk},
+            )
+            added += len(chunk)
+        return added
 
 
 def _chunks(items: list, size: int) -> Iterator[list]:
