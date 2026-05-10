@@ -78,9 +78,88 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
 # Schema management
 # -----------------------------------------------------------------------------
 def init_schema(conn: sqlite3.Connection) -> None:
-    """Apply schema.sql to the connection. Idempotent (CREATE IF NOT EXISTS)."""
+    """Apply schema.sql to the connection.
+
+    Step 1: executescript schema.sql — creates tables with current shape on
+    fresh DBs; CREATE TABLE IF NOT EXISTS makes it a no-op for existing DBs.
+
+    Step 2: run any required Python-side migrations for shape changes that
+    can't be expressed via CREATE TABLE IF NOT EXISTS (e.g., PK changes).
+    Each migration is idempotent and detects whether it needs to run by
+    inspecting the actual table shape, not the schema_meta version.
+    """
     schema_sql = SCHEMA_PATH.read_text()
     conn.executescript(schema_sql)
+    _migrate_label_pks_to_v7(conn)
+
+
+def _migrate_label_pks_to_v7(conn: sqlite3.Connection) -> None:
+    """v6 -> v7: extend label table PKs to include label_value.
+
+    Original PK was (entity_id, label_key) which limited each entity to one
+    value per key. Multi-tag taxonomies (MusicBrainz / Last.fm) need multiple
+    values per key, so the PK is now (entity_id, label_key, label_value).
+
+    Idempotent: detects old PK shape via PRAGMA and only migrates when found.
+    Preserves any existing data (the smoke run on 2026-05-09 left ~24 rows
+    in track_labels that we mustn't lose).
+    """
+    # Drop the v6 effective-label view first — its single-value-per-key
+    # COALESCE design is incompatible with multi-value labels and not
+    # referenced by any code (verified 2026-05-09 with project-wide grep).
+    # The Batch 3 step of genre-enrichment-sprint.md will replace it with
+    # a multi-value-aware v_track_tags view.
+    conn.execute("DROP VIEW IF EXISTS v_track_effective_labels")
+
+    targets = [
+        ("track_labels",  "track_id",  "tracks"),
+        ("album_labels",  "album_id",  "albums"),
+        ("artist_labels", "artist_id", "artists"),
+    ]
+    for label_table, entity_col, parent_table in targets:
+        info = conn.execute(f"PRAGMA table_info({label_table})").fetchall()
+        if not info:
+            continue   # table not present (shouldn't happen post-executescript)
+        # PRAGMA table_info row index 5 is the PK position (0 = not in PK)
+        pk_cols = {row[1] for row in info if row[5] > 0}
+        if "label_value" in pk_cols:
+            continue   # already at v7
+
+        backup_table = f"_{label_table}_v6_backup"
+        # Rebuild the table with the new PK while preserving data.
+        # foreign_keys is a per-connection PRAGMA — turning it off here only
+        # affects this connection during migration, so other code paths are
+        # unaffected. We restore the previous setting after.
+        prior_fk = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+        try:
+            conn.execute("PRAGMA foreign_keys = OFF")
+            conn.execute(f"DROP TABLE IF EXISTS {backup_table}")
+            conn.execute(f"ALTER TABLE {label_table} RENAME TO {backup_table}")
+            conn.execute(f"""
+                CREATE TABLE {label_table} (
+                    {entity_col} INTEGER NOT NULL REFERENCES {parent_table}({entity_col}),
+                    label_key   TEXT NOT NULL,
+                    label_value TEXT NOT NULL,
+                    set_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                    set_by      TEXT,
+                    note        TEXT,
+                    PRIMARY KEY ({entity_col}, label_key, label_value)
+                )
+            """)
+            conn.execute(f"""
+                INSERT INTO {label_table}
+                    ({entity_col}, label_key, label_value, set_at, set_by, note)
+                SELECT {entity_col}, label_key, label_value, set_at, set_by, note
+                FROM {backup_table}
+            """)
+            conn.execute(f"DROP TABLE {backup_table}")
+            # Recreate the index that schema.sql defined alongside the table.
+            conn.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{label_table}_key_value "
+                f"ON {label_table}(label_key, label_value)"
+            )
+        finally:
+            conn.execute(f"PRAGMA foreign_keys = {prior_fk}")
 
 
 def get_schema_version(conn: sqlite3.Connection) -> str | None:

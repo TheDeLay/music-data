@@ -1,0 +1,20 @@
+// NOTE: SyncThing only auto-loads .stignore at the share root, not here.
+// The actual exclusion patterns live in:
+//   /home/jdelay/SyncThing/.stignore                    (Storage share root)
+//   /home/jdelay/SyncThing/Obsidian/TheDeLay/.stignore  (Obsidian share root)
+//
+// This file is project-level documentation explaining what's excluded and
+// why, so future-you reading the project knows the policy without spelunking
+// share roots. If you change the exclusions, mirror them in BOTH share roots.
+//
+// What's excluded:
+//   data/        the SQLite DB; multi-host writes would conflict + lose data
+//   .env         Spotify credentials; one host should hold them
+//   logs/        per-run logs; meaningless on other hosts
+//   .venv/       host-specific Python binaries; large, useless to sync
+//   __pycache__/ + .pytest_cache/  caches; rebuilt on demand
+//
+// What still syncs:
+//   scripts/, sql/, tests/, README.md, INSTALL.md, etc. — convenient for
+//   editing across machines
+//   .git/ — intentionally NOT excluded; this is the canonical workspace

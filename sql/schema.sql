@@ -485,14 +485,17 @@ INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('created_at', datetime('
 -- -----------------------------------------------------------------------------
 -- TRACK_LABELS
 -- -----------------------------------------------------------------------------
+-- v7 (2026-05-09): label_value added to PK so the same key can carry multiple
+-- values. Required for multi-tag taxonomies (MusicBrainz tags + genres,
+-- Last.fm crowd tags). Pre-v7 design assumed one value per key.
 CREATE TABLE IF NOT EXISTS track_labels (
     track_id    INTEGER NOT NULL REFERENCES tracks(track_id),
     label_key   TEXT NOT NULL,
     label_value TEXT NOT NULL,
     set_at      TEXT NOT NULL DEFAULT (datetime('now')),
-    set_by      TEXT,                       -- 'manual', 'rule:genre_match', 'bulk:2026_05_03', etc.
+    set_by      TEXT,                       -- 'manual', 'mb', 'lastfm', 'rule:genre_match', etc.
     note        TEXT,
-    PRIMARY KEY (track_id, label_key)
+    PRIMARY KEY (track_id, label_key, label_value)
 );
 
 CREATE INDEX IF NOT EXISTS idx_track_labels_key_value ON track_labels(label_key, label_value);
@@ -541,6 +544,7 @@ END;
 -- -----------------------------------------------------------------------------
 -- ALBUM_LABELS
 -- -----------------------------------------------------------------------------
+-- v7: label_value in PK (see track_labels for rationale)
 CREATE TABLE IF NOT EXISTS album_labels (
     album_id    INTEGER NOT NULL REFERENCES albums(album_id),
     label_key   TEXT NOT NULL,
@@ -548,7 +552,7 @@ CREATE TABLE IF NOT EXISTS album_labels (
     set_at      TEXT NOT NULL DEFAULT (datetime('now')),
     set_by      TEXT,
     note        TEXT,
-    PRIMARY KEY (album_id, label_key)
+    PRIMARY KEY (album_id, label_key, label_value)
 );
 
 CREATE INDEX IF NOT EXISTS idx_album_labels_key_value ON album_labels(label_key, label_value);
@@ -596,6 +600,7 @@ END;
 -- -----------------------------------------------------------------------------
 -- ARTIST_LABELS
 -- -----------------------------------------------------------------------------
+-- v7: label_value in PK (see track_labels for rationale)
 CREATE TABLE IF NOT EXISTS artist_labels (
     artist_id   INTEGER NOT NULL REFERENCES artists(artist_id),
     label_key   TEXT NOT NULL,
@@ -603,7 +608,7 @@ CREATE TABLE IF NOT EXISTS artist_labels (
     set_at      TEXT NOT NULL DEFAULT (datetime('now')),
     set_by      TEXT,
     note        TEXT,
-    PRIMARY KEY (artist_id, label_key)
+    PRIMARY KEY (artist_id, label_key, label_value)
 );
 
 CREATE INDEX IF NOT EXISTS idx_artist_labels_key_value ON artist_labels(label_key, label_value);
@@ -661,41 +666,12 @@ END;
 -- somewhere in the hierarchy. Tracks/labels with no setting at any level
 -- simply don't appear \u2014 they're "unknown."
 -- -----------------------------------------------------------------------------
+-- v_track_effective_labels was removed in v7 (2026-05-09). Its single-value-
+-- per-key COALESCE design assumed each (entity, label_key) had at most one
+-- label_value — incompatible with the multi-tag taxonomy v7 enabled. No code
+-- referenced the view (verified by project-wide grep). The replacement is
+-- v_track_tags, defined in the Batch 3 step of the genre-enrichment sprint.
 DROP VIEW IF EXISTS v_track_effective_labels;
-CREATE VIEW v_track_effective_labels AS
-WITH all_keys AS (
-    -- Every (track_id, label_key) pair where SOMETHING is set in the chain
-    SELECT t.track_id, tl.label_key FROM tracks t JOIN track_labels tl ON t.track_id = tl.track_id
-    UNION
-    SELECT t.track_id, al.label_key FROM tracks t
-        JOIN album_labels al ON t.album_id = al.album_id
-    UNION
-    SELECT t.track_id, arl.label_key FROM tracks t
-        JOIN track_artists ta ON t.track_id = ta.track_id AND ta.position = 0
-        JOIN artist_labels arl ON ta.artist_id = arl.artist_id
-)
-SELECT
-    ak.track_id,
-    ak.label_key,
-    COALESCE(tl.label_value, al.label_value, arl.label_value)  AS label_value,
-    CASE
-        WHEN tl.label_value  IS NOT NULL THEN 'track'
-        WHEN al.label_value  IS NOT NULL THEN 'album'
-        WHEN arl.label_value IS NOT NULL THEN 'artist'
-    END AS source_level,
-    COALESCE(tl.set_at, al.set_at, arl.set_at) AS set_at,
-    COALESCE(tl.set_by, al.set_by, arl.set_by) AS set_by,
-    COALESCE(tl.note,   al.note,   arl.note)   AS note
-FROM all_keys ak
-JOIN tracks t ON ak.track_id = t.track_id
-LEFT JOIN track_labels tl
-    ON tl.track_id = ak.track_id AND tl.label_key = ak.label_key
-LEFT JOIN album_labels al
-    ON al.album_id = t.album_id AND al.label_key = ak.label_key
-LEFT JOIN track_artists ta
-    ON ta.track_id = t.track_id AND ta.position = 0
-LEFT JOIN artist_labels arl
-    ON arl.artist_id = ta.artist_id AND arl.label_key = ak.label_key;
 
 -- =============================================================================
 -- LISTENING CONTEXTS (mode classification)
@@ -818,5 +794,84 @@ CREATE INDEX IF NOT EXISTS idx_abf_bpm ON acousticbrainz_features(bpm);
 CREATE INDEX IF NOT EXISTS idx_abf_valence ON acousticbrainz_features(valence);
 
 
+-- =============================================================================
+-- v_track_tags  (v7+, multi-source unified view of per-track tag data)
+-- =============================================================================
+-- Surfaces tag data from every source we ingest, keyed by track. A single
+-- track can have many rows (multi-tag taxonomies are explicit, not coalesced).
+--
+-- Sources (in `set_by`):
+--   'mb'                     -- track_labels rows from MusicBrainz tag fetch
+--   'lastfm'                 -- artist_labels rows propagated through track_artists
+--   'manual'                 -- track_labels rows with NULL set_by (user edits)
+--   'classify_artists'       -- artist_classifications rows (manual YAML pipeline)
+--
+-- The `precedence` column is informational, not enforced — callers that want
+-- "manual wins" can filter by precedence='manual' first, then UNION with the
+-- rest. This view doesn't pre-filter because the sprint's open-question #1
+-- (tag normalization) hasn't been resolved.
+--
+-- Sentinel rows (label_key='mb-tags-fetched' / 'lastfm-fetched') are
+-- excluded — they're internal bookkeeping, not tag data.
+-- -----------------------------------------------------------------------------
+DROP VIEW IF EXISTS v_track_tags;
+CREATE VIEW v_track_tags AS
+-- MusicBrainz: track-level tag/genre rows
+SELECT
+    tl.track_id,
+    tl.label_value AS tag,
+    tl.label_key   AS tag_kind,    -- 'tag' or 'genre'
+    'mb'           AS source,
+    'mb'           AS precedence,
+    tl.note        AS source_note  -- e.g., "count=12" from MB
+FROM track_labels tl
+WHERE tl.label_key IN ('tag', 'genre')
+  AND tl.set_by = 'mb'
+
+UNION ALL
+
+-- Last.fm: artist-level tags propagated to all the artist's tracks
+SELECT
+    t.track_id,
+    al.label_value AS tag,
+    al.label_key   AS tag_kind,    -- 'tag' (Last.fm doesn't distinguish genre vs tag)
+    'lastfm'       AS source,
+    'lastfm'       AS precedence,
+    al.note        AS source_note  -- e.g., "count=100" from LF
+FROM artist_labels al
+JOIN track_artists ta ON ta.artist_id = al.artist_id AND ta.position = 0
+JOIN tracks t         ON t.track_id = ta.track_id
+WHERE al.label_key IN ('tag', 'genre')
+  AND al.set_by = 'lastfm'
+
+UNION ALL
+
+-- Manual track-level overrides (set_by NULL = direct user edit)
+SELECT
+    tl.track_id,
+    tl.label_value AS tag,
+    tl.label_key   AS tag_kind,
+    'manual'       AS source,
+    'manual'       AS precedence,
+    tl.note        AS source_note
+FROM track_labels tl
+WHERE tl.label_key IN ('tag', 'genre')
+  AND tl.set_by IS NULL
+
+UNION ALL
+
+-- Manual YAML-driven artist classifications, propagated to tracks
+SELECT
+    t.track_id,
+    ac.classification AS tag,
+    'classification'  AS tag_kind,
+    'classify_artists' AS source,
+    'manual'          AS precedence,
+    ac.method         AS source_note
+FROM artist_classifications ac
+JOIN track_artists ta ON ta.artist_id = ac.artist_id AND ta.position = 0
+JOIN tracks t         ON t.track_id = ta.track_id;
+
+
 -- Bump schema version
-INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', '6');
+INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', '7');
