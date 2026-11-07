@@ -4,8 +4,6 @@
 > Your most-played track might be one you skip half the time. The song you actually love might have four plays and two back-button rewinds.
 > This is the database that knows the difference.
 
-Open-source companion to the article [Spotify Has 12 Years of My Data. I Just Took It Back.](https://thedelay.com/spotify-music-archive/) on TheDeLay.com.
-
 It ingests your full Spotify listening history into a local SQLite database, enriches it with the metadata Spotify's privacy export *doesn't* include (track durations, album release years, artist genres), and exposes engagement signals — what percent of a song you actually finish, your back-button rewind list, your skip rate over time — that turn raw play count into something useful.
 
 The thesis from the article, in one line:
@@ -282,8 +280,6 @@ Everything else is plumbing:
 - **Polymorphic plays.** Tracks, podcast episodes, audiobook chapters all share one `plays` table. `content_type` discriminates; a CHECK constraint enforces the FK invariant at the DB level.
 - **Engagement metrics as views, not stored columns.** `v_track_plays`, `v_track_summary`, `v_artist_summary` compute `percent_played`, `engagement` bucket, `finish_rate` on the fly. Refresh-free.
 
-For the why behind the schema choices — what got considered and rejected, and why this is SQLite instead of Postgres — see the companion piece **music-data: The Schema Story** (publishing shortly on TheDeLay.com).
-
 ---
 
 ## Schema overview
@@ -329,6 +325,4 @@ MIT. See [`LICENSE`](LICENSE). Copyright © 2026 John DeLay.
 
 ## See also
 
-- [Spotify Has 12 Years of My Data. I Just Took It Back.](https://thedelay.com/spotify-music-archive/) — the why
-- [music-data: The Schema Story](https://thedelay.com/spotify-music-archive-nerd-stuff/) — the how (publishing soon)
 - [TheDeLay.com](https://thedelay.com/) — homelab, AI integration, and InfoSec writing
