@@ -4,11 +4,9 @@
 > Your most-played track might be one you skip half the time. The song you actually love might have four plays and two back-button rewinds.
 > This is the database that knows the difference.
 
-Open-source companion to the article [Spotify Has 12 Years of My Data. I Just Took It Back.](https://thedelay.com/spotify-music-archive/) on TheDeLay.com.
-
 It ingests your full Spotify listening history into a local SQLite database, enriches it with the metadata Spotify's privacy export *doesn't* include (track durations, album release years, artist genres), and exposes engagement signals — what percent of a song you actually finish, your back-button rewind list, your skip rate over time — that turn raw play count into something useful.
 
-The thesis from the article, in one line:
+The thesis, in one line:
 
 > A song queued four times and skipped in eight seconds each time is not a hit. It's four rejections.
 
@@ -105,7 +103,7 @@ For new Dev Mode apps registered after February 6, 2026, Spotify's API returns N
 
 The schema still includes these columns (so existing pre-policy apps work, and so the data slot is ready if Spotify ever restores access), but if you're an individual developer running this in 2026 — **expect them to be empty**.
 
-The good news: the article's data-driven analyses don't rely on any of these. Engagement %, finish rate, back-button gold, decade distribution — all work because they use `duration_ms`, `album.release_date`, and the existing play-event signals, none of which are restricted.
+The good news: the data-driven analyses don't rely on any of these. Engagement %, finish rate, back-button gold, decade distribution — all work because they use `duration_ms`, `album.release_date`, and the existing play-event signals, none of which are restricted.
 
 If you want genre, tempo, energy, or valence data, the planned multi-source enrichment will pull it from MusicBrainz and AcousticBrainz instead — open data sources that don't depend on Spotify's policy direction.
 
@@ -162,7 +160,7 @@ If you want to contribute an Apple / Amazon / YouTube extractor, open an issue. 
 - **Keep Premium active.** As long as you want to run this pipeline.
 - **Plan to span enrichment across multiple nights.** A 12-year listening archive isn't a one-evening job.
 - **Don't expect genre-aware features to work out of the box.** They'll come back via MusicBrainz/AcousticBrainz integration in a future version.
-- **The engagement queries work today.** Everything the companion article demonstrates is fully data-backed by what Dev Mode still returns.
+- **The engagement queries work today.** The engagement analysis is fully data-backed by what Dev Mode still returns.
 
 ---
 
@@ -282,8 +280,6 @@ Everything else is plumbing:
 - **Polymorphic plays.** Tracks, podcast episodes, audiobook chapters all share one `plays` table. `content_type` discriminates; a CHECK constraint enforces the FK invariant at the DB level.
 - **Engagement metrics as views, not stored columns.** `v_track_plays`, `v_track_summary`, `v_artist_summary` compute `percent_played`, `engagement` bucket, `finish_rate` on the fly. Refresh-free.
 
-For the why behind the schema choices — what got considered and rejected, and why this is SQLite instead of Postgres — see the companion piece **music-data: The Schema Story** (publishing shortly on TheDeLay.com).
-
 ---
 
 ## Schema overview
@@ -329,6 +325,4 @@ MIT. See [`LICENSE`](LICENSE). Copyright © 2026 John DeLay.
 
 ## See also
 
-- [Spotify Has 12 Years of My Data. I Just Took It Back.](https://thedelay.com/spotify-music-archive/) — the why
-- [music-data: The Schema Story](https://thedelay.com/spotify-music-archive-nerd-stuff/) — the how (publishing soon)
 - [TheDeLay.com](https://thedelay.com/) — homelab, AI integration, and InfoSec writing
